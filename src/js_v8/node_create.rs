@@ -443,6 +443,13 @@ pub(super) fn create_js_node<'s>(
                 assigned_nodes,
                 node_external,
             );
+            install_method(
+                scope,
+                template,
+                "assignedElements",
+                assigned_elements,
+                node_external,
+            );
         }
     }
 
@@ -683,27 +690,79 @@ fn call_global_hook(scope: &mut v8::PinScope<'_, '_>, name: &str, arg: v8::Local
     }
 }
 
+/// Read the `flatten` boolean from an `assignedNodes`/`assignedElements`
+/// options argument (`slot.assignedNodes({ flatten: true })`). Missing options
+/// or a non-object argument mean `false`, per the default option value.
+fn assigned_flatten_flag(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments,
+) -> bool {
+    let Ok(options) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        return false;
+    };
+    let key = v8_str(scope, "flatten");
+    options
+        .get(scope, key.into())
+        .map(|value| value.boolean_value(scope))
+        .unwrap_or(false)
+}
+
+/// The nodes assigned to a `<slot>`. With `flatten`, returns the flattened
+/// assignment (assigned nodes, or the slot's fallback content — with nested
+/// slots expanded — when nothing is assigned), which is exactly the slot's
+/// composed children.
+fn slot_assigned_nodes(node: &NodePtr, flatten: bool) -> Vec<NodePtr> {
+    let backend = crate::dom::shadow::SyntheticShadowTreeBackend;
+    if let Some(shadow_root) = backend.nearest_shadow_root(node) {
+        if let Some(host) = backend.host_for_shadow_root(&shadow_root) {
+            backend.distribute_slots(&host);
+        }
+    }
+    if flatten {
+        backend.composed_children(node)
+    } else {
+        backend.assigned_nodes(node)
+    }
+}
+
+fn nodes_to_js_array<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    nodes: Vec<NodePtr>,
+    node_data: &NodeData,
+) -> v8::Local<'s, v8::Array> {
+    let result_array = v8::Array::new(scope, nodes.len() as i32);
+    for (i, node) in nodes.into_iter().enumerate() {
+        let js_node = create_js_node(scope, node, &node_data.registry, &node_data.document);
+        result_array.set_index(scope, i as u32, js_node.into());
+    }
+    result_array
+}
+
 fn assigned_nodes(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
     mut retval: v8::ReturnValue,
 ) {
     let node_data = node_data_from(args.data());
+    let flatten = assigned_flatten_flag(scope, &args);
+    let nodes = slot_assigned_nodes(&node_data.node, flatten);
+    retval.set(nodes_to_js_array(scope, nodes, node_data).into());
+}
 
-    let backend = crate::dom::shadow::SyntheticShadowTreeBackend;
-    if let Some(shadow_root) = backend.nearest_shadow_root(&node_data.node) {
-        if let Some(host) = backend.host_for_shadow_root(&shadow_root) {
-            backend.distribute_slots(&host);
-        }
-    }
-
-    let nodes = backend.assigned_nodes(&node_data.node);
-    let result_array = v8::Array::new(scope, nodes.len() as i32);
-    for (i, node) in nodes.into_iter().enumerate() {
-        let js_node = create_js_node(scope, node, &node_data.registry, &node_data.document);
-        result_array.set_index(scope, i as u32, js_node.into());
-    }
-    retval.set(result_array.into());
+/// `HTMLSlotElement.assignedElements([options])` — like `assignedNodes` but
+/// filtered to element nodes only (text and other non-element slottables drop).
+fn assigned_elements(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let node_data = node_data_from(args.data());
+    let flatten = assigned_flatten_flag(scope, &args);
+    let elements = slot_assigned_nodes(&node_data.node, flatten)
+        .into_iter()
+        .filter(|node| matches!(&*node.borrow(), Node::Element(_)))
+        .collect();
+    retval.set(nodes_to_js_array(scope, elements, node_data).into());
 }
 
 pub(super) fn v8_str<'s>(scope: &v8::PinScope<'s, '_, ()>, s: &str) -> v8::Local<'s, v8::String> {
