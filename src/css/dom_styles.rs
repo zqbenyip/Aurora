@@ -19,7 +19,7 @@ pub(super) fn collect_styles(
                 collect_styles(child, base_url, identity, output);
             }
         }
-        Node::Text(_) => {}
+        Node::Text(_) | Node::Comment(_) => {}
     }
 }
 

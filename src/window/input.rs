@@ -485,7 +485,7 @@ mod tests {
             Node::Document { children, .. } => children
                 .iter()
                 .find_map(|child| find_element_by_id(child, id)),
-            Node::Text(_) => None,
+            Node::Text(_) | Node::Comment(_) => None,
         }
     }
 

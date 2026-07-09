@@ -228,7 +228,25 @@ fn run_scripts(
     apply_polymer_bindings(runtime.as_mut(), native_ce_reactions);
     pump_ready_work(runtime.as_mut());
     log_youtube_debug_state(runtime.as_mut(), "after-polymer-bindings");
+    run_env_probe_script(runtime.as_mut());
     Some(runtime)
+}
+
+/// Debug hook: execute the JS file named by `AURORA_PROBE_JS` after the boot
+/// sequence settles, so page state can be inspected without recompiling.
+/// Intentionally does nothing unless the env var is set.
+fn run_env_probe_script(runtime: &mut dyn crate::js_engine::JsRuntime) {
+    let Ok(path) = env::var("AURORA_PROBE_JS") else {
+        return;
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(source) => {
+            if let Err(e) = runtime.execute(&source) {
+                eprintln!("[probe] {path} threw: {e}");
+            }
+        }
+        Err(e) => eprintln!("[probe] failed to read {path}: {e}"),
+    }
 }
 
 /// Drive the JS event loop toward quiescence after a script or lifecycle step.

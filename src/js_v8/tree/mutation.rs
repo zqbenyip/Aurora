@@ -278,7 +278,9 @@ pub(crate) fn apply_dom_mutation(
                 Unsupported,
             }
             let target = match &mut *node.borrow_mut() {
-                Node::Text(t) => {
+                // Setting textContent on a Comment replaces its data, same as
+                // Text; it has no render mirror content to resync beyond that.
+                Node::Text(t) | Node::Comment(t) => {
                     t.content = text.clone();
                     TextTarget::TextNode
                 }
@@ -318,7 +320,7 @@ pub(crate) fn apply_dom_mutation(
             let target_id = registry.register(node.clone());
             // Old children become disconnected; capture them (while still
             // connected) and the incoming set for the connect pass. Only when
-            // native reactions are on, to keep the default path allocation-free.
+            // native reactions are on, to keep the opt-out path allocation-free.
             let native_reactions = registry.native_ce_reactions.get();
             let old_children: Vec<NodePtr> = if native_reactions {
                 match &*node.borrow() {
@@ -438,15 +440,37 @@ fn enqueue_lifecycle_reactions(
         if let Some(tag) = tag {
             if is_connected_to(&document, &node) {
                 if let Some(definition) = registry.ce_registry.lookup(&tag) {
-                    let callback = match phase {
-                        LifecyclePhase::Connected => &definition.connected,
-                        LifecyclePhase::Disconnected => &definition.disconnected,
-                    };
-                    if let Some(callback) = callback {
-                        let id = registry.register(node.clone());
-                        registry
-                            .ce_registry
-                            .enqueue_callback(id, callback.clone(), Vec::new());
+                    match phase {
+                        LifecyclePhase::Connected => {
+                            let id = registry.register(node.clone());
+                            if let Some(callback) = &definition.connected {
+                                registry.ce_registry.enqueue_callback(
+                                    id,
+                                    callback.clone(),
+                                    Vec::new(),
+                                    true,
+                                );
+                            } else {
+                                // Defined, but the prototype had no
+                                // connectedCallback to capture: YouTube's
+                                // controller-extraction shells keep the
+                                // lifecycle on `el.polymerController`.
+                                // Enqueue a reaction that resolves the
+                                // callback dynamically at drain time.
+                                registry.ce_registry.enqueue_dynamic_connected(id);
+                            }
+                        }
+                        LifecyclePhase::Disconnected => {
+                            if let Some(callback) = &definition.disconnected {
+                                let id = registry.register(node.clone());
+                                registry.ce_registry.enqueue_callback(
+                                    id,
+                                    callback.clone(),
+                                    Vec::new(),
+                                    false,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -584,7 +608,7 @@ fn child_nodes(node: &NodePtr) -> Vec<NodePtr> {
     match &*node.borrow() {
         Node::Element(el) => el.children.clone(),
         Node::Document { children, .. } => children.clone(),
-        Node::Text(_) => Vec::new(),
+        Node::Text(_) | Node::Comment(_) => Vec::new(),
     }
 }
 
@@ -601,19 +625,31 @@ fn take_document_fragment_children(node: &NodePtr) -> Option<Vec<NodePtr>> {
 pub(crate) fn collect_text(node: &NodePtr) -> String {
     let b = node.borrow();
     match &*b {
-        Node::Text(t) => t.content.clone(),
+        // Reading textContent directly on a Comment yields its data, but a
+        // comment contributes nothing to an ancestor's aggregation (the
+        // descendant walk below only descends through Text children).
+        Node::Text(t) | Node::Comment(t) => t.content.clone(),
         Node::Element(el) => el
             .children
             .iter()
-            .map(collect_text)
+            .map(collect_descendant_text)
             .collect::<Vec<_>>()
             .join(""),
         Node::Document { children, .. } => children
             .iter()
-            .map(collect_text)
+            .map(collect_descendant_text)
             .collect::<Vec<_>>()
             .join(""),
     }
+}
+
+/// `textContent` aggregation for a child position: comments are skipped per
+/// spec ("descendant Text nodes"), everything else recurses via `collect_text`.
+fn collect_descendant_text(node: &NodePtr) -> String {
+    if matches!(&*node.borrow(), Node::Comment(_)) {
+        return String::new();
+    }
+    collect_text(node)
 }
 
 #[allow(dead_code)]
@@ -622,8 +658,9 @@ pub(crate) fn set_text_content(node: &NodePtr, text: &str) {
         Node::Element(el) => el.children = vec![Node::text(text.to_string())],
         // Per spec, setting `textContent` on a Text node replaces its data.
         // Without this, writes to a text node (e.g. Polymer binding updates
-        // rewriting `[[expr]]` annotations) were silently dropped.
-        Node::Text(t) => t.content = text.to_string(),
+        // rewriting `[[expr]]` annotations) were silently dropped. Comments
+        // behave the same (character data).
+        Node::Text(t) | Node::Comment(t) => t.content = text.to_string(),
         Node::Document { .. } => {}
     }
 }
@@ -785,6 +822,7 @@ pub(crate) fn clone_node(node: &NodePtr, deep: bool) -> NodePtr {
         let b = node.borrow();
         match &*b {
             Node::Text(t) => Node::text(t.content.clone()),
+            Node::Comment(t) => Node::comment(t.content.clone()),
             Node::Element(el) => {
                 let children = if deep {
                     el.children.iter().map(|c| clone_node(c, true)).collect()
@@ -864,7 +902,7 @@ mod tests {
             Node::Document { children, .. } => children
                 .iter()
                 .find_map(|child| find_element_by_id(child, id)),
-            Node::Text(_) => None,
+            Node::Text(_) | Node::Comment(_) => None,
         }
     }
 

@@ -438,6 +438,16 @@ impl BlitzDocument {
                     ));
                 }
             },
+            Node::Comment(_) => {
+                if !matches!(blitz_node.data, blitz_dom::NodeData::Comment) {
+                    return Err(MirrorIntegrityError::new(
+                        operation,
+                        Some(legacy_id),
+                        Some(blitz_id),
+                        "legacy comment node maps to non-comment Blitz node",
+                    ));
+                }
+            }
             Node::Element(el) if is_shadow_root_node(dom_node) => {
                 let Some(blitz_el) = blitz_node.data.downcast_element() else {
                     return Err(MirrorIntegrityError::new(
@@ -1485,6 +1495,15 @@ fn create_dom_node(
     match &*node.borrow() {
         Node::Text(text) => {
             let id = mutator.create_text_node(&text.content);
+            maps.legacy_to_blitz.insert(legacy_node_key(node), id);
+            maps.blitz_to_legacy.insert(id, node.clone());
+            id
+        }
+        // Comments mirror 1:1 as Blitz comment nodes (Blitz's layout generates
+        // no boxes for them), keeping child indices and insert-before anchors
+        // aligned between the legacy DOM and the mirror.
+        Node::Comment(_) => {
+            let id = mutator.create_comment_node();
             maps.legacy_to_blitz.insert(legacy_node_key(node), id);
             maps.blitz_to_legacy.insert(id, node.clone());
             id

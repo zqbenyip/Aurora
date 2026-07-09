@@ -251,6 +251,27 @@ pub(super) fn create_js_node<'s>(
         set_text_content,
         node_external,
     );
+    // CharacterData surface, installed ONLY on Text/Comment wrappers: a
+    // `data` accessor on element wrappers would shadow application-level
+    // `.data` properties (Polymer components store their bound data there).
+    if matches!(&*node.borrow(), Node::Text(_) | Node::Comment(_)) {
+        install_accessor(
+            scope,
+            template,
+            "data",
+            get_text_content,
+            set_text_content,
+            node_external,
+        );
+        install_accessor(
+            scope,
+            template,
+            "nodeValue",
+            get_text_content,
+            set_text_content,
+            node_external,
+        );
+    }
     install_accessor(
         scope,
         template,
@@ -800,6 +821,7 @@ fn node_type(node: &NodePtr) -> i32 {
         Node::Element(el) if el.tag_name == "#document-fragment" => 11,
         Node::Element(_) => 1,
         Node::Text(_) => 3,
+        Node::Comment(_) => 8,
         Node::Document { .. } => 9,
     }
 }
@@ -811,6 +833,7 @@ fn node_name(node: &NodePtr) -> String {
         }
         Node::Element(el) => el.tag_name.to_uppercase(),
         Node::Text(_) => "#text".to_string(),
+        Node::Comment(_) => "#comment".to_string(),
         Node::Document { .. } => "#document".to_string(),
     }
 }

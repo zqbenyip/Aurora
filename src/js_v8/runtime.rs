@@ -236,6 +236,14 @@ impl V8Runtime {
                 create_text_node_fn.into(),
             );
 
+            let create_comment_fn = v8::FunctionTemplate::builder(create_comment)
+                .data(doc_external.into())
+                .build(scope);
+            document_template.set(
+                v8_str(scope, "createComment").into(),
+                create_comment_fn.into(),
+            );
+
             let element_from_point_fn = v8::FunctionTemplate::builder(element_from_point)
                 .data(doc_external.into())
                 .build(scope);
@@ -281,9 +289,22 @@ impl V8Runtime {
                     .expect("function template yields a function outside of a pending exception")
                     .into(),
             );
-            // Phase 2 A/B flag: when native CE reactions are on, the JS shim
-            // suppresses its own connectedCallback firing (the native insertion
-            // path drives it via the reaction queue instead).
+            let ce_has_pending_reaction_fn =
+                v8::FunctionTemplate::builder(ce_has_pending_connected_reaction_native)
+                    .data(doc_external.into())
+                    .build(scope);
+            global.set(
+                scope,
+                v8_str(scope, "__aurora_ce_has_pending_connected_reaction_native").into(),
+                ce_has_pending_reaction_fn
+                    .get_function(scope)
+                    .expect("function template yields a function outside of a pending exception")
+                    .into(),
+            );
+            // When native CE reactions are on (the default; see
+            // `NodeRegistry::native_ce_reactions`), the JS shim's upgrade path
+            // defers connectedCallback to the native reaction queue when one is
+            // pending (the trampoline drives it back through connectUpgraded).
             global.set(
                 scope,
                 v8_str(scope, "__aurora_native_ce_reactions__").into(),
@@ -1394,6 +1415,26 @@ fn create_text_node(
     retval.set(js_node.into());
 }
 
+/// `document.createComment(data)` — a real Comment node (`nodeType` 8).
+/// Frameworks use comments as insertion markers and check the node type, so
+/// this must not be approximated with a text node.
+fn create_comment(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let text = args.get(0).to_rust_string_lossy(scope);
+    let data = args.data();
+    let external = v8::Local::<v8::External>::try_from(data)
+        .expect("callback data is always the External we installed");
+    let doc_data_ptr = external.value() as *const DocumentData;
+    let doc_data = unsafe { &*doc_data_ptr };
+
+    let node = Node::comment(text);
+    let js_node = create_js_node(scope, node, &doc_data.registry, &doc_data.document);
+    retval.set(js_node.into());
+}
+
 /// Read a lifecycle callback (`connectedCallback`, …) off a constructor's
 /// prototype, returning a global handle if it's a function.
 fn read_proto_callback(
@@ -1518,6 +1559,37 @@ fn js_value_to_node<'s>(
     }
     let blitz_id = blitz_id_val.int32_value(scope)? as usize;
     registry.dom_node_for_blitz_id(blitz_id)
+}
+
+/// `__aurora_ce_has_pending_connected_reaction_native(el)` — whether the
+/// native reaction queue already holds a (not-yet-drained) `connectedCallback`
+/// reaction for `el`. The JS shim's upgrade path (`connectUpgraded` in
+/// custom_elements.js) calls this to decide whether it still needs to invoke
+/// `connectedCallback` itself: when a real native mutation (e.g.
+/// `appendChild`) already enqueued the reaction, JS must not fire it again;
+/// when none is queued (an out-of-band upgrade, like Aurora's
+/// detached-ShadyDOM-fragment composition), JS falls back to calling it
+/// directly.
+fn ce_has_pending_connected_reaction_native<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut retval: v8::ReturnValue,
+) {
+    let data = args.data();
+    let external = v8::Local::<v8::External>::try_from(data)
+        .expect("callback data is always the External we installed");
+    let doc_data = unsafe { &*(external.value() as *const DocumentData) };
+    let pending = match js_value_to_node(scope, args.get(0), &doc_data.registry) {
+        Some(node) => {
+            let id = doc_data.registry.register(node);
+            doc_data
+                .registry
+                .ce_registry
+                .has_pending_connected_reaction(id)
+        }
+        None => false,
+    };
+    retval.set(v8::Boolean::new(scope, pending).into());
 }
 
 /// `__aurora_ce_upgrade_candidates_native(root)` — collect the elements in a

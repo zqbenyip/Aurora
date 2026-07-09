@@ -28,7 +28,7 @@ impl Eq for ParentLink {}
 pub fn set_parent(child: &NodePtr, parent: &NodePtr) {
     match &mut *child.borrow_mut() {
         Node::Element(el) => el.parent = ParentLink(Rc::downgrade(parent)),
-        Node::Text(text) => text.parent = ParentLink(Rc::downgrade(parent)),
+        Node::Text(text) | Node::Comment(text) => text.parent = ParentLink(Rc::downgrade(parent)),
         _ => {}
     }
 }
@@ -37,16 +37,16 @@ pub fn set_parent(child: &NodePtr, parent: &NodePtr) {
 pub fn clear_parent(child: &NodePtr) {
     match &mut *child.borrow_mut() {
         Node::Element(el) => el.parent = ParentLink(Weak::new()),
-        Node::Text(text) => text.parent = ParentLink(Weak::new()),
+        Node::Text(text) | Node::Comment(text) => text.parent = ParentLink(Weak::new()),
         _ => {}
     }
 }
 
-/// Read `node`'s stored parent, if it is an element/text with a live parent pointer.
+/// Read `node`'s stored parent, if it is an element/text/comment with a live parent pointer.
 pub fn parent_ptr(node: &NodePtr) -> Option<NodePtr> {
     match &*node.borrow() {
         Node::Element(el) => el.parent.0.upgrade(),
-        Node::Text(text) => text.parent.0.upgrade(),
+        Node::Text(text) | Node::Comment(text) => text.parent.0.upgrade(),
         _ => None,
     }
 }
@@ -130,6 +130,13 @@ pub enum Node {
     Element(ElementNode),
     /// Text node containing raw string content and a parent pointer.
     Text(TextNode),
+    /// Comment node (`<!-- … -->`). Shares `TextNode`'s shape (character data
+    /// plus a parent pointer) but is a distinct node type: `nodeType` 8, never
+    /// rendered, excluded from `textContent` aggregation. Frameworks (Polymer's
+    /// dom-if/dom-repeat among them) use comments as insertion markers and
+    /// check `nodeType === 8`, so faking these as text nodes corrupts both
+    /// their marker logic and sibling indices recorded at template-parse time.
+    Comment(TextNode),
 }
 
 /// HTML text node.
@@ -219,6 +226,14 @@ impl Node {
     /// Create a text node containing a string.
     pub fn text(value: impl Into<String>) -> NodePtr {
         Rc::new(RefCell::new(Self::Text(TextNode {
+            content: value.into(),
+            parent: ParentLink::default(),
+        })))
+    }
+
+    /// Create a comment node containing a string.
+    pub fn comment(value: impl Into<String>) -> NodePtr {
+        Rc::new(RefCell::new(Self::Comment(TextNode {
             content: value.into(),
             parent: ParentLink::default(),
         })))

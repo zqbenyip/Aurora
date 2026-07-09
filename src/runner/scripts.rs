@@ -27,7 +27,7 @@ fn walk(node: &crate::dom::NodePtr, scripts: &mut Vec<ExtractedScript>) {
                 walk(child, scripts);
             }
         }
-        crate::dom::Node::Text(_) => {}
+        crate::dom::Node::Text(_) | crate::dom::Node::Comment(_) => {}
     }
 }
 

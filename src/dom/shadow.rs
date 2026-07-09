@@ -163,7 +163,7 @@ impl ShadowTreeBackend for SyntheticShadowTreeBackend {
                     Some(el.assigned_nodes.clone()),
                 ),
                 Node::Document { children, .. } => (None, None, None, children.clone(), None),
-                Node::Text(_) => return Vec::new(),
+                Node::Text(_) | Node::Comment(_) => return Vec::new(),
             }
         };
 

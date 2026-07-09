@@ -58,7 +58,29 @@ enum Reaction {
     Callback {
         callback: v8::Global<v8::Function>,
         args: Vec<v8::Global<v8::Value>>,
+        /// Set only for `connectedCallback` reactions. Aurora's JS shim
+        /// layers Polymer-compat orchestration (readyUpgraded, the
+        /// ytd-app enable/stamp special case, `activeLifecycleHost`
+        /// tracking that ShadyDOM-fragment composition depends on) around
+        /// the raw callback; firing `callback` directly would skip all of
+        /// that. When set, invocation calls the JS trampoline
+        /// (`__aurora_ce_native_connect_trampoline__`) instead, which
+        /// re-runs that orchestration and then calls the real callback
+        /// itself. See `has_pending_connected_reaction`.
+        native_connect: bool,
     },
+    /// `connectedCallback` for an element whose definition captured no
+    /// prototype callback at define time. YouTube's controller-extraction
+    /// pattern registers thin shell classes with an empty prototype; the
+    /// Polymer instance that actually implements the lifecycle lives on a
+    /// lazily-created `polymerController` property of the element, so there
+    /// was nothing to capture when `define` ran. Resolved dynamically at
+    /// drain time: if the element's wrapper exposes a distinct
+    /// `polymerController` object with a callable `connectedCallback`, invoke
+    /// it with the controller as `this`; otherwise do nothing — the JS shim's
+    /// upgrade path owns such elements exactly as it did before native
+    /// reactions existed.
+    DynamicConnected,
     /// `attributeChangedCallback(name, oldValue, newValue, namespace)`. The
     /// string values are held as Rust strings and converted to V8 at drain time,
     /// since the mutation path that enqueues has no V8 scope.
@@ -129,12 +151,30 @@ impl CeRegistry {
         node_id: u32,
         callback: v8::Global<v8::Function>,
         args: Vec<v8::Global<v8::Value>>,
+        native_connect: bool,
     ) {
         self.reaction_queues
             .borrow_mut()
             .entry(node_id)
             .or_default()
-            .push_back(Reaction::Callback { callback, args });
+            .push_back(Reaction::Callback {
+                callback,
+                args,
+                native_connect,
+            });
+        self.enqueue_element_id(node_id);
+    }
+
+    /// Enqueue a dynamically-resolved `connectedCallback` reaction for
+    /// `node_id` (see [`Reaction::DynamicConnected`]). Used when the element's
+    /// tag has a native definition but that definition captured no
+    /// `connectedCallback` from the constructor's prototype.
+    pub(crate) fn enqueue_dynamic_connected(&self, node_id: u32) {
+        self.reaction_queues
+            .borrow_mut()
+            .entry(node_id)
+            .or_default()
+            .push_back(Reaction::DynamicConnected);
         self.enqueue_element_id(node_id);
     }
 
@@ -203,11 +243,34 @@ impl CeRegistry {
             };
             for reaction in reactions {
                 match reaction {
-                    Reaction::Callback { callback, args } => {
+                    Reaction::Callback {
+                        callback,
+                        args,
+                        native_connect,
+                    } => {
+                        if native_connect {
+                            if let Some(trampoline) = native_connect_trampoline(scope) {
+                                let _ = trampoline.call(scope, recv.into(), &[]);
+                                continue;
+                            }
+                        }
                         let cb = v8::Local::new(scope, callback);
                         let arg_locals: Vec<v8::Local<v8::Value>> =
                             args.iter().map(|a| v8::Local::new(scope, a)).collect();
                         let _ = cb.call(scope, recv.into(), &arg_locals);
+                    }
+                    Reaction::DynamicConnected => {
+                        // No controller to drive → the element is a classic
+                        // definition without a prototype connectedCallback
+                        // (e.g. legacy `attached()` components). Fall back to
+                        // the JS trampoline: enqueueing this reaction made the
+                        // shim's connect path defer to us, so the connect MUST
+                        // be delivered here one way or the other.
+                        if !invoke_controller_connected(scope, recv) {
+                            if let Some(trampoline) = native_connect_trampoline(scope) {
+                                let _ = trampoline.call(scope, recv.into(), &[]);
+                            }
+                        }
                     }
                     Reaction::AttributeChanged {
                         callback,
@@ -236,6 +299,38 @@ impl CeRegistry {
         !self.backup_queue.borrow().is_empty()
     }
 
+    /// Whether `node_id` currently has a `connectedCallback` reaction queued
+    /// (enqueued but not yet drained). Used by the JS shim's upgrade path
+    /// (`connectUpgraded`) to decide whether the native insertion path already
+    /// enqueued `connectedCallback` for this element — if so, the JS shim must
+    /// not also call it directly, since the queued reaction will fire when the
+    /// current `[CEReactions]` boundary (or the microtask checkpoint) drains.
+    /// When none is queued (e.g. the element was upgraded out-of-band, via a
+    /// detached-fragment composition rather than a real native mutation call),
+    /// the JS shim falls back to calling `connectedCallback` itself, exactly as
+    /// it did before native reactions existed. Only `native_connect` reactions
+    /// (and their dynamically-resolved [`Reaction::DynamicConnected`]
+    /// counterpart) count: an element can hold a queued
+    /// `attributeChangedCallback` or `disconnectedCallback` without any connect
+    /// pending, and deferring on those would wait for a trampoline call that
+    /// never comes.
+    pub(crate) fn has_pending_connected_reaction(&self, node_id: u32) -> bool {
+        self.reaction_queues
+            .borrow()
+            .get(&node_id)
+            .is_some_and(|queue| {
+                queue.iter().any(|reaction| {
+                    matches!(
+                        reaction,
+                        Reaction::Callback {
+                            native_connect: true,
+                            ..
+                        } | Reaction::DynamicConnected
+                    )
+                })
+            })
+    }
+
     /// Take the current backup queue, leaving it empty.
     fn take_backup_queue(&self) -> Vec<u32> {
         std::mem::take(&mut *self.backup_queue.borrow_mut())
@@ -260,6 +355,65 @@ fn string_or_null<'s>(
             .unwrap_or_else(|| v8::null(scope).into()),
         None => v8::null(scope).into(),
     }
+}
+
+/// Dynamic `connectedCallback` resolution for controller-extracted custom
+/// elements (see [`Reaction::DynamicConnected`]): read the wrapper's
+/// `polymerController` property — this may run the lazy getter that creates
+/// the controller, which is intended; it is what YouTube's own shell classes
+/// do on connect — and invoke its `connectedCallback` with the controller as
+/// `this`. Polymer's `connectedCallback` internally enables the data system
+/// and calls `ready()` on first flush, so this single call drives template
+/// stamping too. A `TryCatch` contains failures so one component's throwing
+/// callback cannot poison the remaining reactions in the drain. Returns
+/// whether a controller callback was actually invoked; on `false` the caller
+/// falls back to the JS trampoline.
+fn invoke_controller_connected(
+    scope: &mut v8::PinScope<'_, '_>,
+    recv: v8::Local<'_, v8::Object>,
+) -> bool {
+    v8::tc_scope!(let scope, scope);
+    let Some(key) = v8::String::new(scope, "polymerController") else {
+        return false;
+    };
+    let Some(ctrl_val) = recv.get(scope, key.into()) else {
+        return false;
+    };
+    let Ok(ctrl) = v8::Local::<v8::Object>::try_from(ctrl_val) else {
+        return false;
+    };
+    if ctrl_val.strict_equals(recv.into()) {
+        return false;
+    }
+    let Some(cb_key) = v8::String::new(scope, "connectedCallback") else {
+        return false;
+    };
+    let Some(cb_val) = ctrl.get(scope, cb_key.into()) else {
+        return false;
+    };
+    let Ok(cb) = v8::Local::<v8::Function>::try_from(cb_val) else {
+        return false;
+    };
+    let _ = cb.call(scope, ctrl.into(), &[]);
+    true
+}
+
+/// Look up `__aurora_ce_native_connect_trampoline__`, the JS shim's
+/// orchestration wrapper around `connectedCallback` (see the doc comment on
+/// `Reaction::Callback::native_connect`). Always present once
+/// `custom_elements.js` has run, which happens unconditionally at bootstrap;
+/// the `None` case is a defensive fallback for callers of `V8Runtime` that
+/// somehow skip bootstrap.
+fn native_connect_trampoline<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let key = v8::String::new(scope, "__aurora_ce_native_connect_trampoline__")
+        .expect("failed to create V8 string");
+    global
+        .get(scope, key.into())
+        .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok())
 }
 
 /// Invoke queued custom-element reactions (Ladybird's
