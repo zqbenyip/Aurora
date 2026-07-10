@@ -2049,6 +2049,26 @@
                     }
                     readyUpgraded(el, name);
                     if (!el.__ce_connected__) {
+                        // When native CE reactions are on AND the native
+                        // insertion path actually enqueued a reaction for this
+                        // element (a real appendChild/insertBefore etc.), it
+                        // will re-enter this function (via
+                        // __aurora_ce_native_connect_trampoline__) when the
+                        // current [CEReactions] boundary drains — defer ALL of
+                        // this block's side effects (including
+                        // connectedCallback itself) to that call so it isn't
+                        // done twice. By the time native fires, the queue
+                        // entry is already consumed, so this check then comes
+                        // back false and the block below runs for real. But
+                        // upgrades that never went through a native mutation
+                        // call (e.g. Aurora's detached ShadyDOM-fragment
+                        // composition) have nothing queued, so this call
+                        // proceeds immediately, same as before native
+                        // reactions existed.
+                        var nativeReactionPending = globalThis.__aurora_native_ce_reactions__ &&
+                            typeof globalThis.__aurora_ce_has_pending_connected_reaction_native === 'function' &&
+                            globalThis.__aurora_ce_has_pending_connected_reaction_native(el);
+                        if (nativeReactionPending) return;
                         installPolymerIdMapHooks(el);
                         rebuildPolymerIdMap(el);
                         installInstanceSetUpPropsHook(el);
@@ -2209,8 +2229,13 @@
                 if (!root) return;
                 try {
                     primeTree(root);
-                    if (typeof root.querySelectorAll === 'function') {
-                        var all = root.querySelectorAll('*');
+                    var all = null;
+                    if (typeof globalThis.__aurora_ce_upgrade_candidates_native === 'function') {
+                        all = globalThis.__aurora_ce_upgrade_candidates_native(root);
+                    } else if (typeof root.querySelectorAll === 'function') {
+                        all = root.querySelectorAll('*');
+                    }
+                    if (all && typeof all.length === 'number') {
                         for (var i = 0; i < all.length; i++) { tryUpgrade(all[i], true); }
                     }
                 } catch (e) {}
@@ -2321,6 +2346,21 @@
 
             globalThis.__aurora_init_custom_elements__ = function() { ensureCreateElementPatch(); };
             globalThis.__aurora_track_custom_element__ = function(el) { rememberPending(el); };
+            // Native connectedCallback reactions (AURORA_NATIVE_CE_REACTIONS)
+            // fire through this trampoline instead of calling the raw
+            // prototype method directly, so an element that becomes connected
+            // via the native insertion path still gets the same orchestration
+            // (readyUpgraded/ready(), rebuildPolymerIdMap, the ytd-app
+            // enable/stamp special case, activeLifecycleHost tracking that
+            // composeDetachedStamp depends on) as one connected via the JS
+            // upgrade path. By the time this runs, the native reaction queue
+            // entry that triggered it has already been consumed, so
+            // connectUpgraded's own pending-reaction check correctly sees
+            // nothing queued for `this` and calls the real connectedCallback.
+            globalThis.__aurora_ce_native_connect_trampoline__ = function() {
+                var name = this.localName || (this.tagName ? this.tagName.toLowerCase() : '');
+                connectUpgraded(this, name, true);
+            };
             globalThis.__aurora_track_fragment__ = function(fragment) {
                 try { if (!fragment || fragment.nodeType !== 11) return fragment; }
                 catch (e) { return fragment; }

@@ -49,6 +49,9 @@ fn dom_telemetry(root: &NodePtr) -> DomTelemetry {
                     walk(tc, t, false);
                 }
             }
+            Node::Comment(_) => {
+                t.total += 1;
+            }
             Node::Text(txt) => {
                 t.total += 1;
                 t.text += 1;

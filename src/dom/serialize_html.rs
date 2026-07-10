@@ -57,6 +57,11 @@ fn serialize_node(node: &NodePtr, out: &mut String, is_rawtext: bool) {
                 out.push_str(&html_escape(&t.content));
             }
         }
+        Node::Comment(t) => {
+            out.push_str("<!--");
+            out.push_str(&t.content);
+            out.push_str("-->");
+        }
     }
 }
 

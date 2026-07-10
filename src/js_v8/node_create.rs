@@ -1,3 +1,4 @@
+use super::custom_elements::CeReactionsGuard;
 use super::registry::NodeRegistry;
 use super::selectors::query;
 use super::style_class::{classlist, style};
@@ -250,6 +251,27 @@ pub(super) fn create_js_node<'s>(
         set_text_content,
         node_external,
     );
+    // CharacterData surface, installed ONLY on Text/Comment wrappers: a
+    // `data` accessor on element wrappers would shadow application-level
+    // `.data` properties (Polymer components store their bound data there).
+    if matches!(&*node.borrow(), Node::Text(_) | Node::Comment(_)) {
+        install_accessor(
+            scope,
+            template,
+            "data",
+            get_text_content,
+            set_text_content,
+            node_external,
+        );
+        install_accessor(
+            scope,
+            template,
+            "nodeValue",
+            get_text_content,
+            set_text_content,
+            node_external,
+        );
+    }
     install_accessor(
         scope,
         template,
@@ -419,6 +441,13 @@ pub(super) fn create_js_node<'s>(
                 template,
                 "assignedNodes",
                 assigned_nodes,
+                node_external,
+            );
+            install_method(
+                scope,
+                template,
+                "assignedElements",
+                assigned_elements,
                 node_external,
             );
         }
@@ -661,27 +690,79 @@ fn call_global_hook(scope: &mut v8::PinScope<'_, '_>, name: &str, arg: v8::Local
     }
 }
 
+/// Read the `flatten` boolean from an `assignedNodes`/`assignedElements`
+/// options argument (`slot.assignedNodes({ flatten: true })`). Missing options
+/// or a non-object argument mean `false`, per the default option value.
+fn assigned_flatten_flag(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments,
+) -> bool {
+    let Ok(options) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        return false;
+    };
+    let key = v8_str(scope, "flatten");
+    options
+        .get(scope, key.into())
+        .map(|value| value.boolean_value(scope))
+        .unwrap_or(false)
+}
+
+/// The nodes assigned to a `<slot>`. With `flatten`, returns the flattened
+/// assignment (assigned nodes, or the slot's fallback content — with nested
+/// slots expanded — when nothing is assigned), which is exactly the slot's
+/// composed children.
+fn slot_assigned_nodes(node: &NodePtr, flatten: bool) -> Vec<NodePtr> {
+    let backend = crate::dom::shadow::SyntheticShadowTreeBackend;
+    if let Some(shadow_root) = backend.nearest_shadow_root(node) {
+        if let Some(host) = backend.host_for_shadow_root(&shadow_root) {
+            backend.distribute_slots(&host);
+        }
+    }
+    if flatten {
+        backend.composed_children(node)
+    } else {
+        backend.assigned_nodes(node)
+    }
+}
+
+fn nodes_to_js_array<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    nodes: Vec<NodePtr>,
+    node_data: &NodeData,
+) -> v8::Local<'s, v8::Array> {
+    let result_array = v8::Array::new(scope, nodes.len() as i32);
+    for (i, node) in nodes.into_iter().enumerate() {
+        let js_node = create_js_node(scope, node, &node_data.registry, &node_data.document);
+        result_array.set_index(scope, i as u32, js_node.into());
+    }
+    result_array
+}
+
 fn assigned_nodes(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
     mut retval: v8::ReturnValue,
 ) {
     let node_data = node_data_from(args.data());
+    let flatten = assigned_flatten_flag(scope, &args);
+    let nodes = slot_assigned_nodes(&node_data.node, flatten);
+    retval.set(nodes_to_js_array(scope, nodes, node_data).into());
+}
 
-    let backend = crate::dom::shadow::SyntheticShadowTreeBackend;
-    if let Some(shadow_root) = backend.nearest_shadow_root(&node_data.node) {
-        if let Some(host) = backend.host_for_shadow_root(&shadow_root) {
-            backend.distribute_slots(&host);
-        }
-    }
-
-    let nodes = backend.assigned_nodes(&node_data.node);
-    let result_array = v8::Array::new(scope, nodes.len() as i32);
-    for (i, node) in nodes.into_iter().enumerate() {
-        let js_node = create_js_node(scope, node, &node_data.registry, &node_data.document);
-        result_array.set_index(scope, i as u32, js_node.into());
-    }
-    retval.set(result_array.into());
+/// `HTMLSlotElement.assignedElements([options])` — like `assignedNodes` but
+/// filtered to element nodes only (text and other non-element slottables drop).
+fn assigned_elements(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let node_data = node_data_from(args.data());
+    let flatten = assigned_flatten_flag(scope, &args);
+    let elements = slot_assigned_nodes(&node_data.node, flatten)
+        .into_iter()
+        .filter(|node| matches!(&*node.borrow(), Node::Element(_)))
+        .collect();
+    retval.set(nodes_to_js_array(scope, elements, node_data).into());
 }
 
 pub(super) fn v8_str<'s>(scope: &v8::PinScope<'s, '_, ()>, s: &str) -> v8::Local<'s, v8::String> {
@@ -799,6 +880,7 @@ fn node_type(node: &NodePtr) -> i32 {
         Node::Element(el) if el.tag_name == "#document-fragment" => 11,
         Node::Element(_) => 1,
         Node::Text(_) => 3,
+        Node::Comment(_) => 8,
         Node::Document { .. } => 9,
     }
 }
@@ -810,6 +892,7 @@ fn node_name(node: &NodePtr) -> String {
         }
         Node::Element(el) => el.tag_name.to_uppercase(),
         Node::Text(_) => "#text".to_string(),
+        Node::Comment(_) => "#comment".to_string(),
         Node::Document { .. } => "#document".to_string(),
     }
 }
@@ -968,6 +1051,7 @@ fn append_child(
 ) {
     let data = args.data();
     let node_data = node_data_from(data);
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     if let Some(child) = node_from_js(scope, args.get(0), &node_data.registry) {
         let fragment_children = if is_document_fragment(&child) {
@@ -1008,6 +1092,7 @@ fn remove_child(
 ) {
     let data = args.data();
     let node_data = node_data_from(data);
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     if let Some(child) = node_from_js(scope, args.get(0), &node_data.registry) {
         let _mutation_result = mutation::apply_dom_mutation(
@@ -1030,6 +1115,7 @@ fn insert_before(
 ) {
     let data = args.data();
     let node_data = node_data_from(data);
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     let new_child = node_from_js(scope, args.get(0), &node_data.registry);
     let ref_child = node_from_js(scope, args.get(1), &node_data.registry);
@@ -1074,6 +1160,7 @@ fn replace_child(
 ) {
     let data = args.data();
     let node_data = node_data_from(data);
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     let new_child = node_from_js(scope, args.get(0), &node_data.registry);
     let old_child = node_from_js(scope, args.get(1), &node_data.registry);
@@ -1112,12 +1199,13 @@ fn replace_child(
 }
 
 fn remove_node(
-    _scope: &mut v8::PinScope<'_, '_>,
+    scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
     mut _retval: v8::ReturnValue,
 ) {
     let data = args.data();
     let node_data = node_data_from(data);
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     if let Some(parent) = find_parent_for_node(node_data) {
         let _mutation_result = mutation::apply_dom_mutation(
@@ -1281,6 +1369,7 @@ fn set_attribute(
     let value = args.get(1).to_rust_string_lossy(scope);
     let data = args.data();
     let node_data = node_data_from(data);
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     let _mutation_result = mutation::apply_dom_mutation(
         &node_data.registry,
@@ -1301,6 +1390,7 @@ fn set_attribute_ns(
     let value = args.get(2).to_rust_string_lossy(scope);
     let data = args.data();
     let node_data = node_data_from(data);
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     let _mutation_result = mutation::apply_dom_mutation(
         &node_data.registry,
@@ -1320,6 +1410,7 @@ fn remove_attribute(
     let name = args.get(0).to_rust_string_lossy(scope);
     let data = args.data();
     let node_data = node_data_from(data);
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     let _mutation_result = mutation::apply_dom_mutation(
         &node_data.registry,
@@ -1338,6 +1429,7 @@ fn remove_attribute_ns(
     let name = args.get(1).to_rust_string_lossy(scope);
     let data = args.data();
     let node_data = node_data_from(data);
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     let _mutation_result = mutation::apply_dom_mutation(
         &node_data.registry,
@@ -1566,6 +1658,7 @@ fn named_node_map_set_named_item(
     }
 
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
     let old = match &*node_data.node.borrow() {
         Node::Element(el) => el.attributes.get(&name).cloned(),
         _ => None,
@@ -1591,6 +1684,7 @@ fn named_node_map_remove_named_item(
 ) {
     let name = args.get(0).to_rust_string_lossy(scope);
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
     let old = match &*node_data.node.borrow() {
         Node::Element(el) => el.attributes.get(&name).cloned(),
         _ => None,
@@ -1633,6 +1727,7 @@ fn set_attr_value(
     attr_name: &str,
 ) {
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
     let value = value.to_rust_string_lossy(scope);
     let _mutation_result = if value.is_empty() {
         mutation::apply_dom_mutation(
@@ -1863,6 +1958,7 @@ fn set_text_content(
     _retval: v8::ReturnValue<()>,
 ) {
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     let text = value.to_rust_string_lossy(scope);
     let _mutation_result = mutation::apply_dom_mutation(
@@ -1913,6 +2009,7 @@ fn set_inner_html(
     _retval: v8::ReturnValue<()>,
 ) {
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     let html = value.to_rust_string_lossy(scope);
     let new_children = parsed_html_nodes(&html);
@@ -2172,6 +2269,7 @@ fn append_children(
     mut _retval: v8::ReturnValue,
 ) {
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
     for i in 0..args.length() {
         let arg = args.get(i);
         let child = if let Some(node) = node_from_js(scope, arg, &node_data.registry) {
@@ -2213,6 +2311,7 @@ fn replace_children(
     mut _retval: v8::ReturnValue,
 ) {
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
 
     let mut children = Vec::new();
     for i in 0..args.length() {
@@ -2240,6 +2339,7 @@ fn prepend_children(
     mut _retval: v8::ReturnValue,
 ) {
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
     for i in (0..args.length()).rev() {
         let arg = args.get(i);
         let child = if let Some(node) = node_from_js(scope, arg, &node_data.registry) {
@@ -2264,6 +2364,7 @@ fn replace_with(
     mut _retval: v8::ReturnValue,
 ) {
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
     let parent = find_parent_for_node(node_data);
     insert_relative_to_self(scope, args, false);
     if let Some(parent) = parent {
@@ -2316,6 +2417,8 @@ fn insert_before_self(
     args: v8::FunctionCallbackArguments,
     mut _retval: v8::ReturnValue,
 ) {
+    let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
     insert_relative_to_self(scope, args, false);
 }
 
@@ -2324,6 +2427,8 @@ fn insert_after_self(
     args: v8::FunctionCallbackArguments,
     mut _retval: v8::ReturnValue,
 ) {
+    let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
     insert_relative_to_self(scope, args, true);
 }
 
@@ -2423,6 +2528,7 @@ fn insert_adjacent_html(
     let position = args.get(0).to_rust_string_lossy(scope);
     let html = args.get(1).to_rust_string_lossy(scope);
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
     insert_nodes_at_position(scope, node_data, &position, parsed_html_nodes(&html));
 }
 
@@ -2434,6 +2540,7 @@ fn insert_adjacent_text(
     let position = args.get(0).to_rust_string_lossy(scope);
     let text = args.get(1).to_rust_string_lossy(scope);
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
     insert_nodes_at_position(scope, node_data, &position, vec![Node::text(text)]);
 }
 
@@ -2445,6 +2552,7 @@ fn insert_adjacent_element(
     let position = args.get(0).to_rust_string_lossy(scope);
     let element_value = args.get(1);
     let node_data = node_data_from(args.data());
+    let _reactions = CeReactionsGuard::new(scope, &node_data.registry);
     let Some(element) = node_from_js(scope, element_value, &node_data.registry) else {
         retval.set(v8::null(scope).into());
         return;

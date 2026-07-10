@@ -162,6 +162,18 @@ impl StyledNode {
                     children: Vec::new(),
                 }
             }
+
+            // Comments generate no boxes; a display:none leaf keeps the
+            // styled tree's child indices aligned with the DOM.
+            Node::Comment(_) => {
+                let mut styles = StyleMap::default();
+                styles.set("display", "none");
+                Self {
+                    node: node.clone(),
+                    styles,
+                    children: Vec::new(),
+                }
+            }
         }
     }
 }

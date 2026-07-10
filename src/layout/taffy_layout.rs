@@ -267,6 +267,10 @@ fn determine_layout_kind(styled_node: &StyledNode) -> LayoutKind {
         Node::Text(text) => LayoutKind::Text {
             text: text.content.clone(),
         },
+        // Comments produce no boxes; an empty text run lays out to nothing.
+        Node::Comment(_) => LayoutKind::Text {
+            text: String::new(),
+        },
         Node::Document { .. } => LayoutKind::Viewport,
     }
 }

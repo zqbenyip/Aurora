@@ -34,6 +34,14 @@ pub(super) struct NodeRegistry {
     /// Native mirror of the JS `customElements` registry (Phase 1 of the native
     /// custom-element-reaction plan). Populated from `customElements.define`.
     pub(super) ce_registry: super::custom_elements::CeRegistry,
+    /// When set, the native insertion path enqueues custom-element lifecycle
+    /// reactions (connected/disconnected/attributeChanged) and the JS shim's
+    /// upgrade path defers connectedCallback to the native trampoline. Default
+    /// ON since the Polymer orchestration migrated into the trampoline
+    /// (validated at parity on real YouTube); set env
+    /// `AURORA_NATIVE_CE_REACTIONS=0` to fall back to the JS-shim-driven path.
+    /// `Cell` so it can be toggled deterministically (tests).
+    pub(super) native_ce_reactions: std::cell::Cell<bool>,
 }
 
 impl NodeRegistry {
@@ -55,6 +63,9 @@ impl NodeRegistry {
             mo_next: RefCell::new(1),
             snapshot_rebuild_reason: RefCell::new(None),
             ce_registry: super::custom_elements::CeRegistry::default(),
+            native_ce_reactions: std::cell::Cell::new(native_ce_reactions_default(
+                std::env::var("AURORA_NATIVE_CE_REACTIONS").ok().as_deref(),
+            )),
         }
     }
 
@@ -470,4 +481,25 @@ impl NodeRegistry {
 struct DirtyState {
     style: bool,
     layout: bool,
+}
+
+/// Resolve the `AURORA_NATIVE_CE_REACTIONS` env var to the flag's initial
+/// value: on unless explicitly opted out with `0`/`false`/`off`.
+fn native_ce_reactions_default(var: Option<&str>) -> bool {
+    !matches!(var, Some("0") | Some("false") | Some("off"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native_ce_reactions_default;
+
+    #[test]
+    fn native_ce_reactions_default_on_with_explicit_opt_out() {
+        assert!(native_ce_reactions_default(None));
+        assert!(native_ce_reactions_default(Some("1")));
+        assert!(native_ce_reactions_default(Some("")));
+        assert!(!native_ce_reactions_default(Some("0")));
+        assert!(!native_ce_reactions_default(Some("false")));
+        assert!(!native_ce_reactions_default(Some("off")));
+    }
 }

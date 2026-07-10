@@ -43,8 +43,7 @@
         }
         return el;
     };
-    // Comments become text nodes (no Comment node type in the DOM core).
-    document.createComment = function(text) { return document.createTextNode(text); };
+    // document.createComment is native (real Comment nodes, nodeType 8).
     document.createDocumentFragment = function() {
         var fragment = document.createElement('#document-fragment');
         if (typeof globalThis.__aurora_track_fragment__ === 'function') {

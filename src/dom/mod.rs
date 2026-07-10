@@ -51,6 +51,8 @@ fn serialize_node(node: &NodePtr, out: &mut String) {
         Node::Text(text) => {
             out.push_str(&html_escape(&text.content));
         }
+        // Comments never contribute to SVG markup handed to usvg.
+        Node::Comment(_) => {}
         Node::Document { children, .. } => {
             for child in children {
                 serialize_node(child, out);

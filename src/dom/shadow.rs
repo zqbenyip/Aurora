@@ -163,7 +163,7 @@ impl ShadowTreeBackend for SyntheticShadowTreeBackend {
                     Some(el.assigned_nodes.clone()),
                 ),
                 Node::Document { children, .. } => (None, None, None, children.clone(), None),
-                Node::Text(_) => return Vec::new(),
+                Node::Text(_) | Node::Comment(_) => return Vec::new(),
             }
         };
 
@@ -174,7 +174,24 @@ impl ShadowTreeBackend for SyntheticShadowTreeBackend {
             return vec![shadow_root];
         }
         if tag_name.as_deref() == Some("slot") {
-            return assigned_nodes.unwrap_or_default();
+            let assigned_nodes = assigned_nodes.unwrap_or_default();
+            if !assigned_nodes.is_empty() {
+                return assigned_nodes;
+            }
+            return children
+                .into_iter()
+                .flat_map(|child| {
+                    let is_slot = child
+                        .borrow()
+                        .as_element()
+                        .is_some_and(|e| e.tag_name == "slot");
+                    if is_slot {
+                        self.composed_children(&child)
+                    } else {
+                        vec![child]
+                    }
+                })
+                .collect();
         }
 
         // Normal element or shadow root: collect children
@@ -220,22 +237,28 @@ impl ShadowTreeBackend for SyntheticShadowTreeBackend {
         }
 
         for child in light_children {
-            let slot_name = child
+            // A slottable's name is its `slot` attribute value, or "" when the
+            // attribute is absent. A slot's name is its `name` attribute value,
+            // or "". Assignment matches on name equality, so both a missing
+            // `slot` attribute and an explicit `slot=""` target the default
+            // (unnamed) slot — as does every non-element slottable (text).
+            let slottable_name = child
                 .borrow()
                 .as_element()
-                .and_then(|el| el.attributes.get("slot").cloned());
+                .and_then(|el| el.attributes.get("slot").cloned())
+                .unwrap_or_default();
 
             let target_slot = slots.iter().find(|slot| {
                 let slot_borrow = slot.borrow();
                 let Some(slot_el) = slot_borrow.as_element() else {
                     return false;
                 };
-                let name = slot_el.attributes.get("name");
-                match (slot_name.as_deref(), name.map(|s| s.as_str())) {
-                    (Some(sn), Some(n)) => sn == n,
-                    (None, None) | (None, Some("")) => true,
-                    _ => false,
-                }
+                let slot_name = slot_el
+                    .attributes
+                    .get("name")
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                slot_name == slottable_name.as_str()
             });
 
             if let Some(slot) = target_slot {
@@ -398,5 +421,95 @@ mod tests {
         // A host without a shadow root composes to just its light children.
         let plain = Node::element("div", vec![Node::element("b", Vec::new())]);
         assert_eq!(backend().composed_children(&plain).len(), 1);
+    }
+
+    #[test]
+    fn composed_children_uses_fallback_content_for_empty_slot() {
+        let host = Node::element("my-el", Vec::new());
+        let root = backend().attach_shadow(&host, "open");
+        let slot = Node::element(
+            "slot",
+            vec![Node::element("span", vec![Node::text("fallback")])],
+        );
+        backend().append_shadow_child(&root, &slot);
+
+        let composed = backend().composed_children(&root);
+        assert_eq!(composed.len(), 1);
+        let Node::Element(el) = &*composed[0].borrow() else {
+            panic!("expected fallback element");
+        };
+        assert_eq!(el.tag_name, "span");
+        assert_eq!(el.children.len(), 1);
+    }
+
+    /// Build an element carrying a single attribute (`name`/`slot`).
+    fn element_with_attr(tag: &str, attr: &str, value: &str) -> NodePtr {
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert(attr.to_string(), value.to_string());
+        Node::element_with_attributes(tag, attrs, Vec::new())
+    }
+
+    #[test]
+    fn distribute_slots_routes_named_and_default_slottables() {
+        // Shadow tree: a default slot and a named "footer" slot.
+        let default_slot = Node::element("slot", Vec::new());
+        let footer_slot = element_with_attr("slot", "name", "footer");
+
+        // Light children: a plain child (default), a `slot="footer"` child, and
+        // a text node (always the default slot).
+        let plain = Node::element("p", Vec::new());
+        let footer_child = element_with_attr("span", "slot", "footer");
+        let text = Node::text("hi");
+        let host = Node::element(
+            "my-el",
+            vec![plain.clone(), footer_child.clone(), text.clone()],
+        );
+        let root = backend().attach_shadow(&host, "open");
+        backend().append_shadow_child(&root, &default_slot);
+        backend().append_shadow_child(&root, &footer_slot);
+
+        backend().distribute_slots(&host);
+
+        let default_assigned = backend().assigned_nodes(&default_slot);
+        assert_eq!(default_assigned.len(), 2);
+        assert!(Rc::ptr_eq(&default_assigned[0], &plain));
+        assert!(Rc::ptr_eq(&default_assigned[1], &text));
+
+        let footer_assigned = backend().assigned_nodes(&footer_slot);
+        assert_eq!(footer_assigned.len(), 1);
+        assert!(Rc::ptr_eq(&footer_assigned[0], &footer_child));
+    }
+
+    #[test]
+    fn distribute_slots_treats_empty_slot_attr_as_default() {
+        // A child with an explicit `slot=""` targets the default (unnamed) slot,
+        // exactly as a missing `slot` attribute does.
+        let default_slot = Node::element("slot", Vec::new());
+        let child = element_with_attr("span", "slot", "");
+        let host = Node::element("my-el", vec![child.clone()]);
+        let root = backend().attach_shadow(&host, "open");
+        backend().append_shadow_child(&root, &default_slot);
+
+        backend().distribute_slots(&host);
+
+        let assigned = backend().assigned_nodes(&default_slot);
+        assert_eq!(assigned.len(), 1);
+        assert!(Rc::ptr_eq(&assigned[0], &child));
+    }
+
+    #[test]
+    fn composed_children_flattens_nested_empty_slots() {
+        let host = Node::element("my-el", Vec::new());
+        let root = backend().attach_shadow(&host, "open");
+        let nested = Node::element("slot", vec![Node::text("nested-fallback")]);
+        let outer = Node::element("slot", vec![nested.clone()]);
+        backend().append_shadow_child(&root, &outer);
+
+        let composed = backend().composed_children(&root);
+        assert_eq!(composed.len(), 1);
+        let Node::Text(text) = &*composed[0].borrow() else {
+            panic!("expected nested fallback text");
+        };
+        assert_eq!(text.content, "nested-fallback");
     }
 }

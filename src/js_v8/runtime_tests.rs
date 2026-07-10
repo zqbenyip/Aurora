@@ -690,6 +690,307 @@ fn v8_define_mirrors_into_native_registry() {
 }
 
 #[test]
+fn v8_native_upgrade_candidates_collect_subtree_elements() {
+    let mut runtime = V8Runtime::new(blank_dom());
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"
+            (() => {
+            const host = document.createElement('div');
+            const child = document.createElement('x-upgrade-candidate');
+            host.appendChild(child);
+            const tags = __aurora_ce_upgrade_candidates_native(host)
+                .map(node => node.localName)
+                .join(',');
+            return tags;
+            })()
+            "#
+        ),
+        Ok("div,x-upgrade-candidate".to_string())
+    );
+}
+
+#[test]
+fn v8_native_reactions_fire_connected_callback_once() {
+    let mut runtime = V8Runtime::new(blank_dom());
+    runtime.set_native_ce_reactions(true);
+
+    // With the CEReactions stack wired, appending a custom element fires
+    // connectedCallback before appendChild returns. The backup queue drain is a
+    // no-op afterward.
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"
+            (() => {
+            globalThis.__cc_calls__ = 0;
+            class NativeConnect extends HTMLElement {
+                connectedCallback() { globalThis.__cc_calls__++; }
+            }
+            customElements.define('native-connect', NativeConnect);
+            const el = document.createElement('native-connect');
+            document.body.appendChild(el);
+            return String(globalThis.__cc_calls__);
+            })()
+            "#
+        ),
+        Ok("1".to_string()),
+        "connectedCallback must fire synchronously at the end of appendChild"
+    );
+
+    assert!(!runtime.drain_custom_element_reactions());
+
+    assert_eq!(
+        runtime.eval_to_string("String(globalThis.__cc_calls__)"),
+        Ok("1".to_string()),
+        "connectedCallback must fire exactly once"
+    );
+
+    // Draining again with nothing queued is still a no-op.
+    assert!(!runtime.drain_custom_element_reactions());
+    assert_eq!(
+        runtime.eval_to_string("String(globalThis.__cc_calls__)"),
+        Ok("1".to_string())
+    );
+}
+
+#[test]
+fn v8_native_reactions_drain_in_mutation_observer_phase() {
+    let mut runtime = V8Runtime::new(blank_dom());
+    runtime.set_native_ce_reactions(true);
+
+    // The production event-loop pump still reaches the MutationObserver
+    // delivery phase, but the queue should already be empty because the
+    // boundary drained synchronously.
+    let _ = runtime.eval_to_string(
+        r#"
+        (() => {
+        globalThis.__cc2__ = 0;
+        class NcTwo extends HTMLElement { connectedCallback() { globalThis.__cc2__++; } }
+        customElements.define('nc-two', NcTwo);
+        document.body.appendChild(document.createElement('nc-two'));
+        return 'ok';
+        })()
+        "#,
+    );
+
+    assert_eq!(
+        runtime.eval_to_string("String(globalThis.__cc2__)"),
+        Ok("1".to_string())
+    );
+    assert!(!runtime.deliver_mutation_records());
+    assert_eq!(
+        runtime.eval_to_string("String(globalThis.__cc2__)"),
+        Ok("1".to_string()),
+        "connectedCallback must not fire again during production mutation delivery"
+    );
+}
+
+#[test]
+fn v8_native_reactions_drain_synchronously() {
+    let mut runtime = V8Runtime::new(blank_dom());
+    runtime.set_native_ce_reactions(true);
+
+    let _ = runtime.eval_to_string(
+        r#"
+        (() => {
+        globalThis.__sync_calls__ = 0;
+        class NativeSync extends HTMLElement {
+            connectedCallback() { globalThis.__sync_calls__++; }
+        }
+        customElements.define('native-sync', NativeSync);
+        const el = document.createElement('native-sync');
+        document.body.appendChild(el);
+        return 'ok';
+        })()
+        "#,
+    );
+
+    // After appendChild (which is a [CEReactions] boundary), connectedCallback should have run synchronously!
+    assert_eq!(
+        runtime.eval_to_string("String(globalThis.__sync_calls__)"),
+        Ok("1".to_string()),
+        "connectedCallback must fire synchronously at the end of the appendChild call"
+    );
+}
+
+#[test]
+fn v8_native_reactions_fire_disconnected_callback() {
+    let mut runtime = V8Runtime::new(blank_dom());
+    runtime.set_native_ce_reactions(true);
+
+    // Removing a connected custom element fires disconnectedCallback at the
+    // end of removeChild. The backup queue drain is a no-op afterward.
+    let _ = runtime.eval_to_string(
+        r#"
+        (() => {
+        globalThis.__dc_calls__ = 0;
+        class NativeDisconnect extends HTMLElement {
+            disconnectedCallback() { globalThis.__dc_calls__++; }
+        }
+        customElements.define('native-disconnect', NativeDisconnect);
+        const el = document.createElement('native-disconnect');
+        document.body.appendChild(el);
+        document.body.removeChild(el);
+        return 'ok';
+        })()
+        "#,
+    );
+
+    assert_eq!(
+        runtime.eval_to_string("String(globalThis.__dc_calls__)"),
+        Ok("1".to_string()),
+        "disconnectedCallback must fire synchronously at the end of removeChild"
+    );
+    assert!(!runtime.drain_custom_element_reactions());
+    assert_eq!(
+        runtime.eval_to_string("String(globalThis.__dc_calls__)"),
+        Ok("1".to_string()),
+        "disconnectedCallback must fire exactly once"
+    );
+}
+
+#[test]
+fn v8_native_reactions_fire_attribute_changed_callback() {
+    let mut runtime = V8Runtime::new(blank_dom());
+    runtime.set_native_ce_reactions(true);
+
+    // attributeChangedCallback fires synchronously for observed attributes, with
+    // the old (null when absent) and new values, in mutation order.
+    let _ = runtime.eval_to_string(
+        r#"
+        (() => {
+        globalThis.__ac_log__ = [];
+        class NativeAttr extends HTMLElement {
+            static get observedAttributes() { return ['data-x']; }
+            attributeChangedCallback(name, oldV, newV) {
+                globalThis.__ac_log__.push(name + ':' + oldV + '->' + newV);
+            }
+        }
+        customElements.define('native-attr', NativeAttr);
+        const el = document.createElement('native-attr');
+        document.body.appendChild(el);
+        el.setAttribute('data-x', '1');   // observed: null -> 1
+        el.setAttribute('data-y', '2');   // NOT observed -> no callback
+        el.setAttribute('data-x', '3');   // observed: 1 -> 3
+        el.removeAttribute('data-x');     // observed: 3 -> null
+        return 'ok';
+        })()
+        "#,
+    );
+
+    assert_eq!(
+        runtime.eval_to_string("globalThis.__ac_log__.join('|')"),
+        Ok("data-x:null->1|data-x:1->3|data-x:3->null".to_string())
+    );
+    assert!(!runtime.drain_custom_element_reactions());
+}
+
+/// `__aurora_ce_has_pending_connected_reaction_native` must report only
+/// pending `connectedCallback` reactions, not just "some reaction queued".
+/// The JS shim (`connectUpgraded`) defers to the native trampoline when this
+/// returns true; a false positive from a queued disconnected/attributeChanged
+/// reaction would make it wait for a trampoline call that never comes, losing
+/// the connectedCallback entirely. Probe the distinction mid-drain: while the
+/// first old child's disconnectedCallback runs, its sibling still has a
+/// disconnected reaction queued (must NOT count) and the incoming child has a
+/// connected reaction queued (must count).
+#[test]
+fn v8_native_pending_connected_check_ignores_non_connect_reactions() {
+    let mut runtime = V8Runtime::new(blank_dom());
+    runtime.set_native_ce_reactions(true);
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"(() => {
+                const probe = [];
+                class XPendOld extends HTMLElement {
+                    disconnectedCallback() {
+                        if (this.id !== 'first') return;
+                        probe.push('sibling=' + __aurora_ce_has_pending_connected_reaction_native(
+                            globalThis.__pend_sibling__));
+                        probe.push('incoming=' + __aurora_ce_has_pending_connected_reaction_native(
+                            globalThis.__pend_incoming__));
+                        probe.push('self=' + __aurora_ce_has_pending_connected_reaction_native(this));
+                    }
+                }
+                let incomingConnected = 0;
+                class XPendNew extends HTMLElement {
+                    connectedCallback() { incomingConnected++; }
+                }
+                customElements.define('x-pend-old', XPendOld);
+                customElements.define('x-pend-new', XPendNew);
+
+                const container = document.createElement('div');
+                document.body.appendChild(container);
+                const first = document.createElement('x-pend-old');
+                first.id = 'first';
+                const sibling = document.createElement('x-pend-old');
+                container.appendChild(first);
+                container.appendChild(sibling);
+                globalThis.__pend_sibling__ = sibling;
+                const incoming = document.createElement('x-pend-new');
+                globalThis.__pend_incoming__ = incoming;
+
+                container.replaceChildren(incoming);
+                return probe.join('|') + '|connected=' + incomingConnected;
+            })()"#,
+        ),
+        Ok("sibling=false|incoming=true|self=false|connected=1".to_string()),
+        "a queued disconnected reaction must not read as a pending connected reaction"
+    );
+}
+
+/// YouTube's controller-extraction pattern: the registered class is a thin
+/// shell whose prototype has no lifecycle methods, so define-time capture
+/// finds nothing; the Polymer instance actually implementing the lifecycle is
+/// created lazily on first access of `el.polymerController`. The native
+/// insertion path must still fire connectedCallback for such elements —
+/// enqueued as `Reaction::DynamicConnected` and resolved through the
+/// controller at drain time, with the controller (not the shell) as `this`.
+#[test]
+fn v8_native_reactions_drive_polymer_controller_connected_callback() {
+    let mut runtime = V8Runtime::new(blank_dom());
+    runtime.set_native_ce_reactions(true);
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"(() => {
+                const log = [];
+                class XCtrlShell extends HTMLElement {
+                    constructor() {
+                        super();
+                        const shell = this;
+                        let ctrl = null;
+                        Object.defineProperty(this, 'polymerController', {
+                            configurable: true,
+                            get() {
+                                if (!ctrl) {
+                                    ctrl = {
+                                        hostElement: shell,
+                                        connectedCallback() {
+                                            log.push('connected host=' + this.hostElement.localName +
+                                                ' this-is-ctrl=' + (this !== shell));
+                                        }
+                                    };
+                                }
+                                return ctrl;
+                            }
+                        });
+                    }
+                }
+                customElements.define('x-ctrl-shell', XCtrlShell);
+                const el = document.createElement('x-ctrl-shell');
+                document.body.appendChild(el);
+                return log.join('|');
+            })()"#,
+        ),
+        Ok("connected host=x-ctrl-shell this-is-ctrl=true".to_string()),
+        "native drain must resolve connectedCallback through polymerController"
+    );
+}
+
+#[test]
 fn v8_custom_element_connects_only_after_append() {
     let mut runtime = V8Runtime::new(blank_dom());
 
@@ -1944,6 +2245,9 @@ fn v8_adopts_shadydom_logical_root_and_connects_lite_children() {
             .expect("render document should build"),
     ));
     let mut runtime = V8Runtime::with_render_document(dom, Some(render_doc.clone()));
+    // Pin the JS-shim-driven path (the AURORA_NATIVE_CE_REACTIONS=0 opt-out);
+    // the `_with_native_reactions` variant below covers the default.
+    runtime.set_native_ce_reactions(false);
 
     assert_eq!(
         runtime.eval_to_string(
@@ -1969,6 +2273,57 @@ fn v8_adopts_shadydom_logical_root_and_connects_lite_children() {
                 // Stamping discovers the already-upgraded child after the host
                 // exposes its logical root. The connect gate must adopt the root
                 // and cross to the connected host.
+                customElements.__aurora_track_custom_element__(child);
+                return [
+                    connected,
+                    child.isConnected,
+                    logicalRoot.host === host,
+                    host.shadowRoot === logicalRoot,
+                    child.textContent,
+                ].join('|');
+            })()"#,
+        ),
+        Ok("1|true|true|true|connected".to_string())
+    );
+
+    render_doc.borrow().validate_mirror_integrity().unwrap();
+}
+
+/// Same scenario as above, with native CE reactions on: `child` becomes
+/// connected purely via `__aurora_track_custom_element__` (detached-fragment
+/// adoption), which never touches a native mutation entry point, so nothing is
+/// ever queued for it natively. The JS fallback in `connectUpgraded` must
+/// still fire `connectedCallback` directly in this case.
+#[test]
+fn v8_adopts_shadydom_logical_root_and_connects_lite_children_with_native_reactions() {
+    let dom = blank_dom();
+    let identity = test_identity();
+    let render_doc = Rc::new(RefCell::new(
+        BlitzDocument::try_from_dom(&dom, None, &identity, 800, 600)
+            .expect("render document should build"),
+    ));
+    let mut runtime = V8Runtime::with_render_document(dom, Some(render_doc.clone()));
+    runtime.set_native_ce_reactions(true);
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"(() => {
+                let connected = 0;
+                class XLite2 extends HTMLElement {
+                    connectedCallback() {
+                        connected++;
+                        this.textContent = 'connected';
+                    }
+                }
+                customElements.define('x-lite2', XLite2);
+
+                const host = document.createElement('x-host2');
+                const logicalRoot = document.createDocumentFragment();
+                const child = document.createElement('x-lite2');
+                logicalRoot.appendChild(child);
+                host.root = logicalRoot;
+                document.body.appendChild(host);
+
                 customElements.__aurora_track_custom_element__(child);
                 return [
                     connected,
@@ -2040,6 +2395,9 @@ fn v8_tracks_fragment_owner_during_custom_element_lifecycle() {
             .expect("render document should build"),
     ));
     let mut runtime = V8Runtime::with_render_document(dom, Some(render_doc.clone()));
+    // Pin the JS-shim-driven path (the AURORA_NATIVE_CE_REACTIONS=0 opt-out);
+    // the `_with_native_reactions` variant below covers the default.
+    runtime.set_native_ce_reactions(false);
 
     assert_eq!(
         runtime.eval_to_string(
@@ -2076,6 +2434,64 @@ fn v8_tracks_fragment_owner_during_custom_element_lifecycle() {
     render_doc.borrow().validate_mirror_integrity().unwrap();
 }
 
+/// Regression test for the native-reactions gap this fix closes: the owner is
+/// inserted via a real `appendChild` (native queues its connectedCallback and
+/// fires it during the drop of `append_child`'s `CeReactionsGuard`), but the
+/// child only becomes connected via Aurora's detached-ShadyDOM-fragment
+/// composition inside that callback — a path that never calls a native
+/// mutation entry point, so nothing is ever queued for it. Before the fix,
+/// `connectUpgraded` unconditionally trusted `__aurora_native_ce_reactions__`
+/// and skipped calling `child.connectedCallback()` itself, so it silently
+/// never fired. `ce_has_pending_connected_reaction_native` lets JS tell the
+/// two cases apart per element instead of gating on the global flag.
+#[test]
+fn v8_tracks_fragment_owner_during_custom_element_lifecycle_with_native_reactions() {
+    let dom = blank_dom();
+    let identity = test_identity();
+    let render_doc = Rc::new(RefCell::new(
+        BlitzDocument::try_from_dom(&dom, None, &identity, 800, 600)
+            .expect("render document should build"),
+    ));
+    let mut runtime = V8Runtime::with_render_document(dom, Some(render_doc.clone()));
+    runtime.set_native_ce_reactions(true);
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"(() => {
+                let childConnected = 0;
+                let ownerConnected = 0;
+                const source = document.createDocumentFragment();
+                source.appendChild(document.createElement('x-tracked-child2'));
+                class XTrackedChild2 extends HTMLElement {
+                    connectedCallback() { childConnected++; }
+                }
+                class XTrackedOwner2 extends HTMLElement {
+                    connectedCallback() {
+                        ownerConnected++;
+                        const root = this.attachShadow({ mode: 'open' });
+                        const stamp = source.cloneNode(true);
+                        const child = stamp.firstChild;
+                        customElements.__aurora_track_custom_element__(child);
+                        this.result = [
+                            stamp.__aurora_fragment_owner__ === this,
+                            child.parentNode === root,
+                            stamp.childNodes.length,
+                        ].join('|');
+                    }
+                }
+                customElements.define('x-tracked-child2', XTrackedChild2);
+                customElements.define('x-tracked-owner2', XTrackedOwner2);
+                const owner = document.createElement('x-tracked-owner2');
+                document.body.appendChild(owner);
+                return owner.result + '|' + childConnected + '|' + ownerConnected;
+            })()"#,
+        ),
+        Ok("true|true|0|1|1".to_string()),
+        "owner's connectedCallback (native-queued) and child's (JS fallback) must each fire exactly once"
+    );
+    render_doc.borrow().validate_mirror_integrity().unwrap();
+}
+
 #[test]
 fn v8_preserves_registered_lifecycle_after_constructor_replaces_prototype() {
     let mut runtime = V8Runtime::new(blank_dom());
@@ -2098,6 +2514,83 @@ fn v8_preserves_registered_lifecycle_after_constructor_replaces_prototype() {
             })()"#,
         ),
         Ok("1|function|true".to_string())
+    );
+}
+
+/// Real Comment nodes: nodeType 8, `#comment` nodeName, CharacterData
+/// surface, exclusion from parent textContent, deep-clone fidelity, and use
+/// as an insertBefore anchor. Polymer's dom-if/dom-repeat rely on comment
+/// markers and on childNodes indices staying exactly as recorded at
+/// template-parse time, so comments must be first-class nodes rather than
+/// approximated with text nodes (nodeType 3), as they were historically.
+#[test]
+fn v8_supports_comment_nodes() {
+    let dom = blank_dom();
+    let identity = test_identity();
+    let render_doc = Rc::new(RefCell::new(
+        BlitzDocument::try_from_dom(&dom, None, &identity, 800, 600)
+            .expect("render document should build"),
+    ));
+    let mut runtime = V8Runtime::with_render_document(dom, Some(render_doc.clone()));
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"(() => {
+                const c = document.createComment('marker');
+                const parts = [];
+                parts.push(c.nodeType);
+                parts.push(c.nodeName);
+                parts.push(c.data);
+                parts.push(c.textContent);
+
+                const div = document.createElement('div');
+                div.appendChild(document.createTextNode('a'));
+                div.appendChild(c);
+                div.appendChild(document.createTextNode('b'));
+                document.body.appendChild(div);
+                parts.push(div.childNodes.length);
+                parts.push(div.textContent);
+
+                c.textContent = 'renamed';
+                parts.push(c.data);
+
+                const clone = div.cloneNode(true);
+                parts.push(clone.childNodes.length);
+                parts.push(clone.childNodes[1].nodeType);
+                parts.push(clone.childNodes[1].data);
+
+                const span = document.createElement('span');
+                div.insertBefore(span, c);
+                parts.push(div.childNodes.length);
+                parts.push(div.childNodes[1].nodeName.toLowerCase());
+                parts.push(div.childNodes[2].nodeType);
+                return parts.join('|');
+            })()"#,
+        ),
+        Ok("8|#comment|marker|marker|3|ab|renamed|3|8|renamed|4|span|8".to_string())
+    );
+
+    render_doc.borrow().validate_mirror_integrity().unwrap();
+}
+
+/// Comments written via innerHTML survive the HTML parser as real comment
+/// nodes and serialize back out as `<!-- -->` markup.
+#[test]
+fn v8_parses_and_serializes_comments_in_inner_html() {
+    let mut runtime = V8Runtime::new(blank_dom());
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"(() => {
+                const div = document.createElement('div');
+                div.innerHTML = '<span>x</span><!--mark--><b>y</b>';
+                const kinds = [];
+                for (let i = 0; i < div.childNodes.length; i++) {
+                    kinds.push(div.childNodes[i].nodeType);
+                }
+                return kinds.join(',') + '|' + div.innerHTML;
+            })()"#,
+        ),
+        Ok("1,8,1|<span>x</span><!--mark--><b>y</b>".to_string())
     );
 }
 

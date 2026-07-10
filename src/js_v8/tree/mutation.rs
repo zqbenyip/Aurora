@@ -87,6 +87,7 @@ pub(crate) fn apply_dom_mutation(
             let inserted_nodes = insertion_nodes(child);
             let added_ids = node_ids(registry, &inserted_nodes);
             append_child_ptr(parent, child);
+            enqueue_connected_reactions(registry, &inserted_nodes);
             let render_synced =
                 sync_inserted_nodes_to_render_document(registry, parent, &inserted_nodes);
             if render_synced {
@@ -107,6 +108,7 @@ pub(crate) fn apply_dom_mutation(
             let inserted_nodes = insertion_nodes(child);
             let added_ids = node_ids(registry, &inserted_nodes);
             prepend_child_ptr(parent, child);
+            enqueue_connected_reactions(registry, &inserted_nodes);
             let render_synced =
                 sync_inserted_nodes_to_render_document(registry, parent, &inserted_nodes);
             if render_synced {
@@ -131,6 +133,7 @@ pub(crate) fn apply_dom_mutation(
             let inserted_nodes = insertion_nodes(new_child);
             let added_ids = node_ids(registry, &inserted_nodes);
             insert_before_ptr(parent, new_child, ref_child);
+            enqueue_connected_reactions(registry, &inserted_nodes);
             let render_synced =
                 sync_inserted_nodes_to_render_document(registry, parent, &inserted_nodes);
             if render_synced {
@@ -149,6 +152,7 @@ pub(crate) fn apply_dom_mutation(
         DomMutation::RemoveChild { parent, child } => {
             let target_id = registry.register(parent.clone());
             let child_id = registry.register(child.clone());
+            enqueue_disconnected_reactions(registry, child);
             remove_child_ptr(parent, child);
             let render_synced = sync_removed_node_from_render_document(registry, child);
             if render_synced {
@@ -173,7 +177,9 @@ pub(crate) fn apply_dom_mutation(
             let inserted_nodes = insertion_nodes(new_child);
             let added_ids = node_ids(registry, &inserted_nodes);
             let old_id = registry.register(old_child.clone());
+            enqueue_disconnected_reactions(registry, old_child);
             replace_child_ptr(parent, new_child, old_child);
+            enqueue_connected_reactions(registry, &inserted_nodes);
             let render_synced = sync_removed_node_from_render_document(registry, old_child)
                 && sync_inserted_nodes_to_render_document(registry, parent, &inserted_nodes);
             if render_synced {
@@ -192,11 +198,21 @@ pub(crate) fn apply_dom_mutation(
         DomMutation::SetAttribute { node, name, value } => {
             let target_id = registry.register(node.clone());
             let mut changed = false;
+            let mut old_value = None;
             if let Node::Element(el) = &mut *node.borrow_mut() {
-                el.attributes.insert(name.to_string(), value.to_string());
+                old_value = el
+                    .attributes
+                    .insert(name.to_string(), value.to_string());
                 changed = true;
             }
             let render_synced = if changed {
+                enqueue_attribute_changed_reaction(
+                    registry,
+                    node,
+                    name,
+                    old_value,
+                    Some(value.to_string()),
+                );
                 registry.mark_style_dirty(node);
                 let render_synced = registry.sync_attribute_to_render_document(node, name, value);
                 if render_synced {
@@ -218,11 +234,17 @@ pub(crate) fn apply_dom_mutation(
         DomMutation::RemoveAttribute { node, name } => {
             let target_id = registry.register(node.clone());
             let mut changed = false;
+            let mut old_value = None;
             if let Node::Element(el) = &mut *node.borrow_mut() {
-                el.attributes.remove(name);
+                old_value = el.attributes.remove(name);
                 changed = true;
             }
             let render_synced = if changed {
+                // Only a real removal (the attribute existed) is an attribute
+                // change for the callback's purposes.
+                if old_value.is_some() {
+                    enqueue_attribute_changed_reaction(registry, node, name, old_value, None);
+                }
                 registry.mark_style_dirty(node);
                 let render_synced = registry.sync_remove_attribute_from_render_document(node, name);
                 if render_synced {
@@ -256,7 +278,9 @@ pub(crate) fn apply_dom_mutation(
                 Unsupported,
             }
             let target = match &mut *node.borrow_mut() {
-                Node::Text(t) => {
+                // Setting textContent on a Comment replaces its data, same as
+                // Text; it has no render mirror content to resync beyond that.
+                Node::Text(t) | Node::Comment(t) => {
                     t.content = text.clone();
                     TextTarget::TextNode
                 }
@@ -294,6 +318,27 @@ pub(crate) fn apply_dom_mutation(
         }
         DomMutation::ReplaceChildren { node, children } => {
             let target_id = registry.register(node.clone());
+            // Old children become disconnected; capture them (while still
+            // connected) and the incoming set for the connect pass. Only when
+            // native reactions are on, to keep the opt-out path allocation-free.
+            let native_reactions = registry.native_ce_reactions.get();
+            let old_children: Vec<NodePtr> = if native_reactions {
+                match &*node.borrow() {
+                    Node::Element(el) => el.children.clone(),
+                    Node::Document { children, .. } => children.clone(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            for old in &old_children {
+                enqueue_disconnected_reactions(registry, old);
+            }
+            let new_children: Vec<NodePtr> = if native_reactions {
+                children.clone()
+            } else {
+                Vec::new()
+            };
             let changed = match &mut *node.borrow_mut() {
                 Node::Element(el) => {
                     el.children = children;
@@ -311,6 +356,7 @@ pub(crate) fn apply_dom_mutation(
             if changed {
                 let cleared = registry.sync_clear_children_in_render_document(node);
                 crate::dom::reparent_subtree(node);
+                enqueue_connected_reactions(registry, &new_children);
                 let reattached = registry.sync_children_to_render_document(node);
                 render_synced = cleared && reattached;
                 if !render_synced {
@@ -347,6 +393,150 @@ pub(crate) fn apply_dom_mutation(
 
 fn insertion_nodes(node: &NodePtr) -> Vec<NodePtr> {
     document_fragment_children(node).unwrap_or_else(|| vec![node.clone()])
+}
+
+/// Which lifecycle callback a subtree walk enqueues.
+#[derive(Clone, Copy)]
+enum LifecyclePhase {
+    Connected,
+    Disconnected,
+}
+
+/// Native custom-element-reaction plan: for every connected custom element in a
+/// subtree, enqueue a `connectedCallback` (insertion) or `disconnectedCallback`
+/// (removal) reaction. The native counterpart to the shadow-including
+/// inclusive-descendant walk in Ladybird's insertion/removal algorithms
+/// (`LibWeb/DOM/Node.cpp:674-714`). Gated by `AURORA_NATIVE_CE_REACTIONS`; a
+/// no-op when off.
+///
+/// For removal, call this *before* detaching the subtree so `is_connected_to`
+/// still sees the elements as connected — mirroring Ladybird, which runs the
+/// removing steps before the parent link is cleared.
+fn enqueue_lifecycle_reactions(
+    registry: &Rc<NodeRegistry>,
+    roots: &[NodePtr],
+    phase: LifecyclePhase,
+) {
+    if !registry.native_ce_reactions.get() {
+        return;
+    }
+    let document = match registry.document.borrow().clone() {
+        Some(doc) => doc,
+        None => return,
+    };
+    // Tree-order walk: process a node, then push its children/shadow so the
+    // parent's reaction enqueues before its descendants'.
+    let mut stack: Vec<NodePtr> = roots.iter().rev().cloned().collect();
+    while let Some(node) = stack.pop() {
+        let (tag, children, shadow, template) = match &*node.borrow() {
+            Node::Element(el) => (
+                Some(el.tag_name.clone()),
+                el.children.clone(),
+                el.shadow_root.clone(),
+                el.template_contents.clone(),
+            ),
+            _ => (None, Vec::new(), None, None),
+        };
+        if let Some(tag) = tag {
+            if is_connected_to(&document, &node) {
+                if let Some(definition) = registry.ce_registry.lookup(&tag) {
+                    match phase {
+                        LifecyclePhase::Connected => {
+                            let id = registry.register(node.clone());
+                            if let Some(callback) = &definition.connected {
+                                registry.ce_registry.enqueue_callback(
+                                    id,
+                                    callback.clone(),
+                                    Vec::new(),
+                                    true,
+                                );
+                            } else {
+                                // Defined, but the prototype had no
+                                // connectedCallback to capture: YouTube's
+                                // controller-extraction shells keep the
+                                // lifecycle on `el.polymerController`.
+                                // Enqueue a reaction that resolves the
+                                // callback dynamically at drain time.
+                                registry.ce_registry.enqueue_dynamic_connected(id);
+                            }
+                        }
+                        LifecyclePhase::Disconnected => {
+                            if let Some(callback) = &definition.disconnected {
+                                let id = registry.register(node.clone());
+                                registry.ce_registry.enqueue_callback(
+                                    id,
+                                    callback.clone(),
+                                    Vec::new(),
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(template) = template {
+            stack.push(template);
+        }
+        if let Some(shadow) = shadow {
+            stack.push(shadow);
+        }
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+}
+
+/// Enqueue `connectedCallback` reactions for a freshly-inserted subtree.
+fn enqueue_connected_reactions(registry: &Rc<NodeRegistry>, inserted: &[NodePtr]) {
+    enqueue_lifecycle_reactions(registry, inserted, LifecyclePhase::Connected);
+}
+
+/// Enqueue `disconnectedCallback` reactions for a subtree about to be removed.
+/// Must be called *before* the subtree is detached.
+fn enqueue_disconnected_reactions(registry: &Rc<NodeRegistry>, removed: &NodePtr) {
+    enqueue_lifecycle_reactions(
+        registry,
+        std::slice::from_ref(removed),
+        LifecyclePhase::Disconnected,
+    );
+}
+
+/// Enqueue an `attributeChangedCallback` reaction for a single element if its
+/// native definition observes `name` and has the callback. Unlike connect/
+/// disconnect, this fires regardless of connectivity (it tracks upgraded custom
+/// elements). Gated by `AURORA_NATIVE_CE_REACTIONS`.
+fn enqueue_attribute_changed_reaction(
+    registry: &Rc<NodeRegistry>,
+    node: &NodePtr,
+    name: &str,
+    old_value: Option<String>,
+    new_value: Option<String>,
+) {
+    if !registry.native_ce_reactions.get() {
+        return;
+    }
+    let tag = match &*node.borrow() {
+        Node::Element(el) => el.tag_name.clone(),
+        _ => return,
+    };
+    let definition = match registry.ce_registry.lookup(&tag) {
+        Some(definition) => definition,
+        None => return,
+    };
+    if !definition.observed_attributes.contains(name) {
+        return;
+    }
+    if let Some(callback) = &definition.attribute_changed {
+        let id = registry.register(node.clone());
+        registry.ce_registry.enqueue_attribute_changed(
+            id,
+            callback.clone(),
+            name.to_string(),
+            old_value,
+            new_value,
+        );
+    }
 }
 
 fn node_ids(registry: &Rc<NodeRegistry>, nodes: &[NodePtr]) -> Vec<u32> {
@@ -418,7 +608,7 @@ fn child_nodes(node: &NodePtr) -> Vec<NodePtr> {
     match &*node.borrow() {
         Node::Element(el) => el.children.clone(),
         Node::Document { children, .. } => children.clone(),
-        Node::Text(_) => Vec::new(),
+        Node::Text(_) | Node::Comment(_) => Vec::new(),
     }
 }
 
@@ -435,19 +625,31 @@ fn take_document_fragment_children(node: &NodePtr) -> Option<Vec<NodePtr>> {
 pub(crate) fn collect_text(node: &NodePtr) -> String {
     let b = node.borrow();
     match &*b {
-        Node::Text(t) => t.content.clone(),
+        // Reading textContent directly on a Comment yields its data, but a
+        // comment contributes nothing to an ancestor's aggregation (the
+        // descendant walk below only descends through Text children).
+        Node::Text(t) | Node::Comment(t) => t.content.clone(),
         Node::Element(el) => el
             .children
             .iter()
-            .map(collect_text)
+            .map(collect_descendant_text)
             .collect::<Vec<_>>()
             .join(""),
         Node::Document { children, .. } => children
             .iter()
-            .map(collect_text)
+            .map(collect_descendant_text)
             .collect::<Vec<_>>()
             .join(""),
     }
+}
+
+/// `textContent` aggregation for a child position: comments are skipped per
+/// spec ("descendant Text nodes"), everything else recurses via `collect_text`.
+fn collect_descendant_text(node: &NodePtr) -> String {
+    if matches!(&*node.borrow(), Node::Comment(_)) {
+        return String::new();
+    }
+    collect_text(node)
 }
 
 #[allow(dead_code)]
@@ -456,8 +658,9 @@ pub(crate) fn set_text_content(node: &NodePtr, text: &str) {
         Node::Element(el) => el.children = vec![Node::text(text.to_string())],
         // Per spec, setting `textContent` on a Text node replaces its data.
         // Without this, writes to a text node (e.g. Polymer binding updates
-        // rewriting `[[expr]]` annotations) were silently dropped.
-        Node::Text(t) => t.content = text.to_string(),
+        // rewriting `[[expr]]` annotations) were silently dropped. Comments
+        // behave the same (character data).
+        Node::Text(t) | Node::Comment(t) => t.content = text.to_string(),
         Node::Document { .. } => {}
     }
 }
@@ -619,6 +822,7 @@ pub(crate) fn clone_node(node: &NodePtr, deep: bool) -> NodePtr {
         let b = node.borrow();
         match &*b {
             Node::Text(t) => Node::text(t.content.clone()),
+            Node::Comment(t) => Node::comment(t.content.clone()),
             Node::Element(el) => {
                 let children = if deep {
                     el.children.iter().map(|c| clone_node(c, true)).collect()
@@ -698,7 +902,7 @@ mod tests {
             Node::Document { children, .. } => children
                 .iter()
                 .find_map(|child| find_element_by_id(child, id)),
-            Node::Text(_) => None,
+            Node::Text(_) | Node::Comment(_) => None,
         }
     }
 

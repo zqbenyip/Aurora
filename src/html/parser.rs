@@ -66,7 +66,7 @@ impl AuroraTreeSink {
         match &mut *parent.borrow_mut() {
             Node::Document { children, .. } => append_or_merge_text(children, child.clone()),
             Node::Element(element) => append_or_merge_text(&mut element.children, child.clone()),
-            Node::Text(_) => return,
+            Node::Text(_) | Node::Comment(_) => return,
         }
         self.parents.borrow_mut().insert(key, parent.clone());
     }
@@ -79,7 +79,7 @@ impl AuroraTreeSink {
         let children = match &mut *parent_borrow {
             Node::Document { children, .. } => children,
             Node::Element(element) => &mut element.children,
-            Node::Text(_) => return,
+            Node::Text(_) | Node::Comment(_) => return,
         };
         children.retain(|child| !Rc::ptr_eq(child, target));
     }
@@ -92,7 +92,7 @@ impl AuroraTreeSink {
         let children = match &mut *parent_borrow {
             Node::Document { children, .. } => children,
             Node::Element(element) => &mut element.children,
-            Node::Text(_) => return,
+            Node::Text(_) | Node::Comment(_) => return,
         };
         let index = children
             .iter()
@@ -167,9 +167,9 @@ impl TreeSink for AuroraTreeSink {
         }
     }
 
-    fn create_comment(&self, _text: StrTendril) -> Self::Handle {
+    fn create_comment(&self, text: StrTendril) -> Self::Handle {
         HtmlHandle {
-            node: Node::text(""),
+            node: Node::comment(text.to_string()),
             name: None,
         }
     }
@@ -262,7 +262,7 @@ impl TreeSink for AuroraTreeSink {
         let children = match &mut *node.node.borrow_mut() {
             Node::Document { children, .. } => std::mem::take(children),
             Node::Element(element) => std::mem::take(&mut element.children),
-            Node::Text(_) => Vec::new(),
+            Node::Text(_) | Node::Comment(_) => Vec::new(),
         };
         for child in children {
             self.append_child(&new_parent.node, child);
@@ -305,7 +305,7 @@ fn prune_whitespace_text(node: &NodePtr, preserve_text_whitespace: bool) {
     let children = match &mut *node_borrow {
         Node::Document { children, .. } => children,
         Node::Element(element) => &mut element.children,
-        Node::Text(_) => return,
+        Node::Text(_) | Node::Comment(_) => return,
     };
 
     children.retain(|child| {
