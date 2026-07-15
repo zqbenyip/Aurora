@@ -36,6 +36,29 @@ pub(crate) struct V8Runtime {
     document: NodePtr,
 }
 
+/// RAII entry into this runtime's isolate.
+///
+/// `v8::OwnedIsolate` enters its isolate on creation and requires it to be the
+/// thread's *current* isolate when dropped, which forces strict
+/// reverse-creation drop order if isolates simply stay entered forever — a
+/// non-starter for multiple tabs, each owning a runtime, closed in arbitrary
+/// order. Instead, `V8Runtime` exits its isolate at the end of construction and
+/// re-enters it only for the duration of each V8-touching operation via this
+/// guard (V8 explicitly permits re-entering the current isolate, so nested
+/// guarded calls are fine). `V8Runtime::drop` enters one final time so the
+/// `OwnedIsolate` drop assertion holds no matter when the runtime is dropped.
+struct EnteredIsolate {
+    isolate: *const v8::Isolate,
+}
+
+impl Drop for EnteredIsolate {
+    fn drop(&mut self) {
+        // Safety: the guard never outlives the borrow of the V8Runtime that
+        // created it, so the isolate is alive; enter/exit calls are balanced.
+        unsafe { (*self.isolate).exit() };
+    }
+}
+
 type NetworkTaskResult = Result<crate::fetch::http::HttpResponse, String>;
 
 struct NetworkTasks {
@@ -1027,6 +1050,9 @@ impl V8Runtime {
 
             v8::Global::new(scope, context)
         };
+        // Leave the isolate un-entered at rest; every V8-touching method
+        // re-enters it via `entered()`. See `EnteredIsolate`.
+        unsafe { isolate.exit() };
         Self {
             isolate,
             context,
@@ -1034,6 +1060,18 @@ impl V8Runtime {
             _network_tasks: network_tasks,
             registry,
             document,
+        }
+    }
+
+    /// Make this runtime's isolate the thread's current isolate until the
+    /// returned guard drops. Must be taken before creating any scope on
+    /// `self.isolate`. The guard holds a raw pointer (not a borrow) so scope
+    /// macros can still borrow the isolate mutably while it is alive.
+    fn entered(&mut self) -> EnteredIsolate {
+        let isolate: &v8::Isolate = &self.isolate;
+        unsafe { isolate.enter() };
+        EnteredIsolate {
+            isolate: isolate as *const v8::Isolate,
         }
     }
 
@@ -1047,6 +1085,7 @@ impl V8Runtime {
     #[cfg(test)]
     pub(crate) fn set_native_ce_reactions(&mut self, on: bool) {
         self.registry.native_ce_reactions.set(on);
+        let _entered = self.entered();
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         let context = v8::Local::new(scope, &self.context);
         let global = context.global(scope);
@@ -1062,11 +1101,13 @@ impl V8Runtime {
         if !self.registry.ce_registry.has_pending_reactions() {
             return false;
         }
+        let _entered = self.entered();
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         super::custom_elements::drain_reactions(scope, &self.registry)
     }
 
     pub(crate) fn eval_to_string(&mut self, source: &str) -> Result<String, String> {
+        let _entered = self.entered();
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let scope, scope);
         compile_and_run(scope, source)
@@ -1089,6 +1130,7 @@ impl V8Runtime {
     }
 
     fn run_js_quiet(&mut self, source: &str) {
+        let _entered = self.entered();
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let scope, scope);
         let _ = compile_and_run(scope, source);
@@ -1106,6 +1148,18 @@ impl V8Runtime {
              }} catch (err) {{}} }})();"
         );
         self.run_js_quiet(&source);
+    }
+}
+
+impl Drop for V8Runtime {
+    fn drop(&mut self) {
+        // `OwnedIsolate::drop` asserts its isolate is the thread's current one
+        // and exits it. The runtime keeps its isolate un-entered at rest, so
+        // enter here (unbalanced on purpose — the OwnedIsolate exit is the
+        // matching exit, and the `isolate` field drops first). This is what
+        // lets runtimes (tabs) be dropped in any order.
+        let isolate: &v8::Isolate = &self.isolate;
+        unsafe { isolate.enter() };
     }
 }
 
@@ -2064,6 +2118,7 @@ fn exception_message(
 
 impl crate::js_engine::JsRuntime for V8Runtime {
     fn execute(&mut self, script: &str) -> Result<(), String> {
+        let _entered = self.entered();
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let scope, scope);
         compile_and_run(scope, script).map(|_| ())
@@ -2127,6 +2182,7 @@ impl crate::js_engine::JsRuntime for V8Runtime {
         }
 
         {
+            let _entered = self.entered();
             v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
             let context = v8::Local::new(scope, &self.context);
             let global = context.global(scope);
@@ -2164,6 +2220,7 @@ impl crate::js_engine::JsRuntime for V8Runtime {
         if !super::mutation_observer::has_pending(&self.registry) {
             return reactions;
         }
+        let _entered = self.entered();
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         super::mutation_observer::deliver(scope, &self.registry) || reactions
     }
@@ -2179,6 +2236,7 @@ impl crate::js_engine::JsRuntime for V8Runtime {
             return false;
         }
 
+        let _entered = self.entered();
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         let context = v8::Local::new(scope, &self.context);
         let global = context.global(scope);

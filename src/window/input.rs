@@ -67,6 +67,66 @@ pub struct WindowInput {
 }
 
 impl WindowInput {
+    /// Build the input for a freshly opened tab: a small built-in new-tab page
+    /// with no JS runtime. When `home_url` is known it is rendered as a plain
+    /// link, so the existing click-to-navigate path takes it from there.
+    pub(crate) fn blank(identity: Identity, viewport: ViewportSize, home_url: Option<&str>) -> Self {
+        let home_link = home_url
+            .map(|url| format!("<p><a href=\"{url}\">{url}</a></p>"))
+            .unwrap_or_default();
+        let html = format!(
+            "<html><head><title>New Tab</title><style>\
+             body {{ font-family: monospace; background: rgb(255,249,251); \
+                     color: rgb(105,54,76); padding: 48px; }}\
+             h1 {{ font-size: 24px; }} a {{ color: rgb(198,87,133); }}\
+             </style></head>\
+             <body><h1>Aurora</h1><p>New tab.</p>{home_link}</body></html>"
+        );
+        let dom = crate::html::Parser::new(&html).parse_document();
+        crate::dom::reparent_subtree(&dom);
+        let mut stylesheet = Stylesheet::from_dom(&dom, None, &identity);
+        stylesheet.merge(Stylesheet::user_agent_stylesheet());
+        let content_viewport = ViewportSize {
+            width: viewport.width,
+            height: (viewport.height - crate::window::BROWSER_CHROME_HEIGHT).max(1.0),
+        };
+        let style_tree = StyleTree::from_dom(&dom, &stylesheet);
+        let layout = LayoutTree::from_style_tree_with_viewport(&style_tree, content_viewport);
+        let blitz_doc = BlitzDocument::try_from_dom(
+            &dom,
+            None,
+            &identity,
+            content_viewport.width as u32,
+            content_viewport.height as u32,
+        )
+        .map(|doc| Rc::new(RefCell::new(doc)));
+
+        WindowInput {
+            dom,
+            stylesheet: Rc::new(RefCell::new(stylesheet)),
+            base_url: None,
+            identity,
+            viewport: Rc::new(RefCell::new(viewport)),
+            layout: Rc::new(RefCell::new(layout)),
+            images: crate::ImageCache::default(),
+            svgs: crate::SvgCache::default(),
+            media: MediaCache::default(),
+            runtime: None,
+            blitz_doc,
+            needs_reflow: false,
+            blitz_snapshot_dirty: false,
+            pending_snapshot_rebuild_reason: None,
+            pending_snapshot_rebuild_source: None,
+            snapshot_rebuild_count: 0,
+            consecutive_snapshot_rebuilds: 0,
+            last_snapshot_rebuild_reason: None,
+            last_snapshot_rebuild_source: None,
+            last_snapshot_rebuild_op_id: None,
+            #[cfg(debug_assertions)]
+            snapshot_rebuild_events: VecDeque::new(),
+        }
+    }
+
     pub(crate) fn reflow(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
