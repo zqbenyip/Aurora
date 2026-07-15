@@ -2767,3 +2767,31 @@ fn v8_composed_path_includes_shadow_root_between_child_and_host() {
         Ok("true|true".to_string())
     );
 }
+
+#[test]
+fn multiple_runtimes_interleave_and_drop_in_any_order() {
+    // Multi-tab support: each tab owns a runtime (and thus a V8 isolate) on the
+    // same thread. Operations must be able to interleave across runtimes, and
+    // runtimes must be droppable in arbitrary order — not just reverse order of
+    // creation (tabs close in whatever order the user closes them).
+    let mut first = V8Runtime::new(blank_dom());
+    let mut second = V8Runtime::new(blank_dom());
+    let mut third = V8Runtime::new(blank_dom());
+
+    first.eval_to_string("globalThis.who = 'first'").unwrap();
+    second.eval_to_string("globalThis.who = 'second'").unwrap();
+    third.eval_to_string("globalThis.who = 'third'").unwrap();
+
+    // Interleaved access: contexts stay isolated per runtime.
+    assert_eq!(first.eval_to_string("who"), Ok("first".to_string()));
+    assert_eq!(second.eval_to_string("who"), Ok("second".to_string()));
+    assert_eq!(first.eval_to_string("who"), Ok("first".to_string()));
+
+    // Drop the *middle* runtime first, then the oldest; the survivors must
+    // still execute. With enter-forever isolates this ordering panics.
+    drop(second);
+    assert_eq!(first.eval_to_string("who"), Ok("first".to_string()));
+    assert_eq!(third.eval_to_string("who"), Ok("third".to_string()));
+    drop(first);
+    assert_eq!(third.eval_to_string("who"), Ok("third".to_string()));
+}

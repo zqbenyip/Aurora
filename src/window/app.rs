@@ -7,49 +7,157 @@ use vello::{Renderer, RendererOptions, Scene, wgpu};
 use winit::window::Window;
 
 use super::BROWSER_CHROME_HEIGHT;
-use super::chrome::ChromeRenderer;
+use super::chrome::{ChromeProps, ChromeRenderer};
 use super::input::{SnapshotRebuildReason, WindowInput};
 use crate::blitz_document::PaintResult;
 
-pub(super) struct AuroraApp {
+/// One browser tab: its page state plus per-tab view state. Each tab owns its
+/// own JS runtime (and thus its own V8 isolate); `V8Runtime` keeps isolates
+/// un-entered at rest, so tabs can be closed (dropped) in any order.
+pub(super) struct Tab {
     pub(super) input: WindowInput,
+    pub(super) scroll_y: f64,
+    frame_cache: LastGoodSceneState,
+}
+
+impl Tab {
+    pub(super) fn new(input: WindowInput) -> Self {
+        Self {
+            input,
+            scroll_y: 0.0,
+            frame_cache: LastGoodSceneState::default(),
+        }
+    }
+}
+
+pub(super) struct AuroraApp {
+    /// Open tabs; never empty. Only the active tab is ticked and painted —
+    /// background tabs are effectively suspended until re-activated.
+    pub(super) tabs: Vec<Tab>,
+    pub(super) active: usize,
+    /// URL of the initial page, offered as a link on new-tab pages.
+    home_url: Option<String>,
     pub(super) context: RenderContext,
     pub(super) renderers: Vec<Option<Renderer>>,
     pub(super) surface: Option<RenderSurface<'static>>,
     pub(super) window: Option<Arc<Window>>,
-    pub(super) scroll_y: f64,
     pub(super) mouse_x: f64,
     pub(super) mouse_y: f64,
+    pub(super) modifiers: winit::keyboard::ModifiersState,
     pub(super) chrome: ChromeRenderer,
-    content_frame_cache: LastGoodSceneState,
+    /// `Some(buffer)` while the address bar has keyboard focus. Window-level
+    /// rather than per-tab: switching tabs drops an in-progress edit, like
+    /// mainstream browsers.
+    pub(super) url_edit: Option<String>,
 }
 
 impl AuroraApp {
     pub(super) fn new(input: WindowInput) -> Self {
+        let home_url = input.base_url.clone();
         Self {
-            input,
+            tabs: vec![Tab::new(input)],
+            active: 0,
+            home_url,
             context: RenderContext::new(),
             renderers: Vec::new(),
             surface: None,
             window: None,
-            scroll_y: 0.0,
             mouse_x: 0.0,
             mouse_y: 0.0,
+            modifiers: winit::keyboard::ModifiersState::default(),
             chrome: ChromeRenderer::default(),
-            content_frame_cache: LastGoodSceneState::default(),
+            url_edit: None,
         }
     }
 
+    pub(super) fn tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    pub(super) fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    pub(super) fn input(&self) -> &WindowInput {
+        &self.tabs[self.active].input
+    }
+
+    pub(super) fn input_mut(&mut self) -> &mut WindowInput {
+        &mut self.tabs[self.active].input
+    }
+
+    /// Open a new tab showing the built-in new-tab page and make it active.
+    /// The address bar starts focused so a URL can be typed immediately.
+    pub(super) fn open_new_tab(&mut self) {
+        let viewport = *self.input().viewport.borrow();
+        let input = WindowInput::blank(
+            self.input().identity.clone(),
+            viewport,
+            self.home_url.as_deref(),
+        );
+        self.tabs.push(Tab::new(input));
+        self.activate_tab(self.tabs.len() - 1);
+        self.url_edit = Some(String::new());
+    }
+
+    /// Close a tab. Returns false when the last tab was closed, i.e. the
+    /// caller should exit the app. Tabs drop in click order, not creation
+    /// order — the V8 isolate lifecycle explicitly supports this.
+    pub(super) fn close_tab(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return true;
+        }
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            return false;
+        }
+        // Closing a tab left of the active one shifts the active tab down by
+        // one; closing the active tab itself falls through to its right
+        // neighbour (or the new last tab).
+        let next = if index < self.active {
+            self.active - 1
+        } else {
+            self.active
+        };
+        self.activate_tab(next.min(self.tabs.len() - 1));
+        true
+    }
+
+    pub(super) fn activate_tab(&mut self, index: usize) {
+        self.url_edit = None;
+        self.active = index.min(self.tabs.len() - 1);
+        // The window may have been resized while this tab was inactive;
+        // reflow against the real surface size, not the tab's stale viewport.
+        if let Some(surface) = self.surface.as_ref() {
+            let (w, h) = (surface.config.width, surface.config.height);
+            self.reflow(w, h);
+        }
+    }
+
+    pub(super) fn cycle_tab(&mut self, backwards: bool) {
+        let len = self.tabs.len();
+        if len < 2 {
+            return;
+        }
+        let next = if backwards {
+            (self.active + len - 1) % len
+        } else {
+            (self.active + 1) % len
+        };
+        self.activate_tab(next);
+    }
+
     pub(super) fn reflow(&mut self, width: u32, height: u32) {
-        self.input.reflow(width, height);
+        self.input_mut().reflow(width, height);
     }
 
     pub(super) fn run_frame_tasks(&mut self) -> bool {
         let now = Instant::now();
-        let mut needs_reflow = self.input.needs_reflow;
+        let input = self.input_mut();
+        let mut needs_reflow = input.needs_reflow;
         let mut runtime_dirtied_blitz = false;
 
-        if let Some(runtime) = self.input.runtime.as_mut() {
+        if let Some(runtime) = input.runtime.as_mut() {
             let runtime_needs_reflow = runtime.tick(now)
                 | runtime.drain_animation_frame_callbacks(now)
                 | runtime.deliver_mutation_records()
@@ -60,12 +168,11 @@ impl AuroraApp {
                 needs_reflow = true;
             }
         }
-        if runtime_dirtied_blitz && self.input.blitz_doc.is_none() {
-            self.input
-                .mark_blitz_snapshot_dirty(SnapshotRebuildReason::MissingMapping);
+        if runtime_dirtied_blitz && input.blitz_doc.is_none() {
+            input.mark_blitz_snapshot_dirty(SnapshotRebuildReason::MissingMapping);
         }
 
-        let needs_redraw = self.input.media.update();
+        let needs_redraw = self.input_mut().media.update();
         if needs_reflow {
             self.perform_sync_reflow();
         }
@@ -78,19 +185,19 @@ impl AuroraApp {
     /// and Blitz Paint, while the legacy LayoutTree remains the source for tests,
     /// screenshots, JS layout accessors, and current hit testing.
     pub(super) fn perform_sync_reflow(&mut self) {
-        let viewport = *self.input.viewport.borrow();
+        let viewport = *self.input().viewport.borrow();
         self.reflow(viewport.width as u32, viewport.height as u32);
     }
 
     pub(super) fn next_runtime_deadline(&self) -> Option<Instant> {
-        self.input
+        self.input()
             .runtime
             .as_ref()
             .and_then(|runtime| runtime.next_deadline())
     }
 
     pub(super) fn has_animation_frame_callbacks(&self) -> bool {
-        self.input
+        self.input()
             .runtime
             .as_ref()
             .map(|runtime| runtime.has_animation_frame_callbacks())
@@ -108,18 +215,9 @@ impl AuroraApp {
 
         let mut scene = Scene::new();
         paint_content_layer(self, &mut scene, width, height);
-        let url = self
-            .input
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "aurora://local".to_string());
-        self.chrome.paint(
-            &mut scene,
-            width,
-            &url,
-            &self.input.dom,
-            &self.input.identity,
-        );
+        let chrome_props = self.chrome_props();
+        let identity = self.input().identity.clone();
+        self.chrome.paint(&mut scene, width, chrome_props, &identity);
 
         let Some(surface) = self.surface.as_ref() else {
             return;
@@ -165,6 +263,32 @@ impl AuroraApp {
         surface_texture.present();
     }
 
+    /// Chrome props for the live window: every tab's label plus the active
+    /// tab's URL, telemetry, and identity.
+    fn chrome_props(&self) -> ChromeProps {
+        let url = |input: &WindowInput| {
+            input
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "aurora://local".to_string())
+        };
+        let labels = self
+            .tabs
+            .iter()
+            .map(|tab| super::chrome::tab_label(&url(&tab.input), &tab.input.dom))
+            .collect();
+        let active_input = self.input();
+        let mut props = ChromeProps::from_tabs(
+            &url(active_input),
+            &active_input.dom,
+            &active_input.identity,
+            labels,
+            self.active,
+        );
+        props.url_edit = self.url_edit.clone();
+        props
+    }
+
     fn handle_content_paint_failure(
         &mut self,
         paint_result: PaintResult,
@@ -172,10 +296,11 @@ impl AuroraApp {
         width: u32,
         content_height: u32,
     ) -> PaintResult {
-        self.input
+        let tab = &mut self.tabs[self.active];
+        tab.input
             .mark_blitz_snapshot_dirty(SnapshotRebuildReason::PaintFailure);
-        self.input.needs_reflow = true;
-        let effective_result = self.content_frame_cache.finish_failed_paint(
+        tab.input.needs_reflow = true;
+        let effective_result = tab.frame_cache.finish_failed_paint(
             paint_result,
             content_scene,
             width,
@@ -184,8 +309,8 @@ impl AuroraApp {
         if matches!(effective_result, PaintResult::PreservedLastGoodFrame) {
             log::warn!(
                 "Preserving last successful Blitz content frame after paint failure: consecutive_failures={} last_successful_paint_time={:?}",
-                self.content_frame_cache.consecutive_paint_failures,
-                self.content_frame_cache.last_successful_paint_time
+                tab.frame_cache.consecutive_paint_failures,
+                tab.frame_cache.last_successful_paint_time
             );
         }
         effective_result
@@ -274,14 +399,14 @@ fn paint_content_layer(app: &mut AuroraApp, scene: &mut Scene, width: u32, heigh
         &vello::kurbo::Rect::new(-2.0, content_top, width as f64 + 2.0, height as f64),
     );
     let mut content_scene = Scene::new();
-    if let Some(blitz_doc) = app.input.blitz_doc.as_ref().cloned() {
+    if let Some(blitz_doc) = app.input().blitz_doc.as_ref().cloned() {
         let paint_result =
             blitz_doc
                 .borrow_mut()
                 .paint_to_scene(&mut content_scene, width, content_height);
         match paint_result {
             PaintResult::PaintedCurrentFrame => {
-                app.content_frame_cache.record_successful_paint(
+                app.tab_mut().frame_cache.record_successful_paint(
                     &content_scene,
                     width,
                     content_height,
@@ -301,7 +426,7 @@ fn paint_content_layer(app: &mut AuroraApp, scene: &mut Scene, width: u32, heigh
     }
     scene.append(
         &content_scene,
-        Some(Affine::translate((0.0, content_top - app.scroll_y))),
+        Some(Affine::translate((0.0, content_top - app.tab().scroll_y))),
     );
     scene.pop_layer();
 }
@@ -441,10 +566,86 @@ mod tests {
     }
 
     #[test]
+    fn open_new_tab_appends_and_activates() {
+        let mut app = AuroraApp::new(test_input());
+        assert_eq!(app.tabs.len(), 1);
+
+        app.open_new_tab();
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active, 1);
+        // The new tab shows the built-in new-tab page, not the first tab's DOM.
+        assert!(app.input().base_url.is_none());
+        // ...with the address bar focused and empty, ready for typing.
+        assert_eq!(app.url_edit.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn switching_tabs_drops_an_in_progress_url_edit() {
+        let mut app = AuroraApp::new(test_input());
+        app.open_new_tab();
+        app.url_edit = Some("example.co".to_string());
+
+        app.activate_tab(0);
+
+        assert!(app.url_edit.is_none());
+    }
+
+    #[test]
+    fn close_tab_left_of_active_keeps_active_page() {
+        let mut app = AuroraApp::new(test_input());
+        app.open_new_tab();
+        app.open_new_tab();
+        assert_eq!(app.active, 2);
+
+        assert!(app.close_tab(0));
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active, 1, "active index shifts down with the removal");
+    }
+
+    #[test]
+    fn close_active_tab_falls_through_to_right_neighbour_or_last() {
+        let mut app = AuroraApp::new(test_input());
+        app.open_new_tab();
+        app.open_new_tab();
+
+        // Close the middle tab while it is active.
+        app.activate_tab(1);
+        assert!(app.close_tab(1));
+        assert_eq!(app.active, 1, "right neighbour takes the slot");
+
+        // Close the last tab while it is active.
+        assert!(app.close_tab(1));
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn closing_the_only_tab_signals_exit() {
+        let mut app = AuroraApp::new(test_input());
+        assert!(!app.close_tab(0));
+        assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn cycle_tab_wraps_in_both_directions() {
+        let mut app = AuroraApp::new(test_input());
+        app.open_new_tab();
+        app.open_new_tab();
+        app.activate_tab(2);
+
+        app.cycle_tab(false);
+        assert_eq!(app.active, 0, "forward cycle wraps to the first tab");
+        app.cycle_tab(true);
+        assert_eq!(app.active, 2, "backward cycle wraps to the last tab");
+    }
+
+    #[test]
     fn recoverable_content_paint_failure_preserves_scene_and_schedules_recovery() {
         let mut app = AuroraApp::new(test_input());
         let scene = scene_with_rect();
-        app.content_frame_cache
+        app.tab_mut()
+            .frame_cache
             .record_successful_paint(&scene, 800, 540, Instant::now());
         let mut failed_scene = Scene::new();
 
@@ -457,10 +658,10 @@ mod tests {
 
         assert_eq!(result, PaintResult::PreservedLastGoodFrame);
         assert_eq!(failed_scene.encoding().n_paths, scene.encoding().n_paths);
-        assert!(app.input.blitz_snapshot_dirty);
-        assert!(app.input.needs_reflow);
+        assert!(app.input().blitz_snapshot_dirty);
+        assert!(app.input().needs_reflow);
         assert_eq!(
-            app.input.pending_snapshot_rebuild_reason,
+            app.input().pending_snapshot_rebuild_reason,
             Some(SnapshotRebuildReason::PaintFailure)
         );
     }

@@ -5,6 +5,6 @@ mod dioxus_chrome;
 mod display;
 
 pub(in crate::window) use dioxus_chrome::{
-    CHROME_HEIGHT, ChromeProps, ChromeRenderer, chrome_html,
+    CHROME_HEIGHT, ChromeHit, ChromeProps, ChromeRenderer, chrome_hit_test, chrome_html, tab_label,
 };
 pub(in crate::window) use display::chrome_display_url;
