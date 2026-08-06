@@ -93,6 +93,7 @@ impl StyledNode {
                 let current_data = ElementData {
                     tag_name: element.tag_name.clone(),
                     attributes: element.attributes.clone(),
+                    custom_element_defined: element.custom_element_defined,
                 };
                 let mut styles = stylesheet.styles_for(
                     &current_data,
@@ -187,6 +188,7 @@ fn element_siblings_of(children: &[crate::dom::NodePtr]) -> Vec<ElementData> {
                 Some(ElementData {
                     tag_name: el.tag_name.clone(),
                     attributes: el.attributes.clone(),
+                    custom_element_defined: el.custom_element_defined,
                 })
             } else {
                 None

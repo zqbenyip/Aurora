@@ -886,6 +886,143 @@ fn v8_native_reactions_fire_attribute_changed_callback() {
     assert!(!runtime.drain_custom_element_reactions());
 }
 
+/// Genuine native-first upgrade for a `class ... extends HTMLElement`
+/// definition: registered directly through `__aurora_ce_define_native`,
+/// bypassing `customElements.define`, so the JS shim's own eager
+/// `tryUpgrade` (which normally wins the construction race — see
+/// `run_upgrade_constructor`'s `wrapper_is_already_upgraded` shortcut) never
+/// touches the element. This is the code path every other native-reaction
+/// test in this file avoids exercising, since they all go through
+/// `customElements.define`/`document.createElement`, both of which the shim
+/// intercepts.
+///
+/// Verifies the full spec order in one pass: the constructor runs, the
+/// `HTMLElement` constructor sets the instance's prototype from
+/// `new.target` (so `super()` inside a `class` upgrade adopts the existing
+/// element rather than minting a detached one — the fix in
+/// `PatchedHTMLElement`), and only *after* construction succeeds are
+/// `attributeChangedCallback` (for the attribute already present) and
+/// `connectedCallback` invoked, in that order, exactly once each.
+#[test]
+fn v8_native_first_upgrade_constructs_class_style_element_in_spec_order() {
+    let mut runtime = V8Runtime::new(blank_dom());
+    runtime.set_native_ce_reactions(true);
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"(() => {
+                globalThis.__order__ = [];
+                const el = document.createElement('x-native-first');
+                el.setAttribute('data-x', '1');
+
+                class C extends HTMLElement {
+                    constructor() {
+                        super();
+                        this.__marked__ = true;
+                        globalThis.__order__.push('ctor');
+                    }
+                    static get observedAttributes() { return ['data-x']; }
+                    attributeChangedCallback(name, oldV, newV) {
+                        globalThis.__order__.push('attr:' + name + ':' + oldV + '->' + newV);
+                    }
+                    connectedCallback() { globalThis.__order__.push('connected'); }
+                }
+                // Native-only definition: the JS shim's registry never
+                // learns about 'x-native-first', so its own eager upgrade
+                // paths (document.createElement's patch, flushPending) find
+                // no definition and leave the element alone.
+                __aurora_ce_define_native('x-native-first', C);
+
+                document.body.appendChild(el);
+
+                return 'proto=' + (Object.getPrototypeOf(el) === C.prototype) +
+                    ' marked=' + !!el.__marked__ +
+                    ' state=' + __aurora_ce_state_native(el) +
+                    ' order=' + globalThis.__order__.join(',');
+            })()"#,
+        ),
+        Ok("proto=true marked=true state=custom order=ctor,attr:data-x:null->1,connected".to_string())
+    );
+}
+
+/// The ES5-adapter shape (`function C() { HTMLElement.call(this); }`,
+/// Polymer's `custom-elements-es5-adapter` pattern) must upgrade through the
+/// same native construction-stack path as a `class` constructor, with no
+/// special-casing. Companion to the `class`-style test above.
+#[test]
+fn v8_native_first_upgrade_constructs_es5_style_element_via_construction_stack() {
+    let mut runtime = V8Runtime::new(blank_dom());
+    runtime.set_native_ce_reactions(true);
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"(() => {
+                globalThis.__es5_order__ = [];
+                const el = document.createElement('x-native-first-es5');
+
+                function C() {
+                    const self = HTMLElement.call(this) || this;
+                    self.__marked__ = true;
+                    globalThis.__es5_order__.push('ctor');
+                    return self;
+                }
+                C.prototype = Object.create(HTMLElement.prototype);
+                C.prototype.constructor = C;
+                C.prototype.connectedCallback = function() {
+                    globalThis.__es5_order__.push('connected');
+                };
+                __aurora_ce_define_native('x-native-first-es5', C);
+
+                document.body.appendChild(el);
+
+                return 'proto=' + (Object.getPrototypeOf(el) === C.prototype) +
+                    ' marked=' + !!el.__marked__ +
+                    ' state=' + __aurora_ce_state_native(el) +
+                    ' order=' + globalThis.__es5_order__.join(',');
+            })()"#,
+        ),
+        Ok("proto=true marked=true state=custom order=ctor,connected".to_string())
+    );
+}
+
+/// A constructor that throws leaves the element `Failed`, per spec, and the
+/// element keeps its original prototype rather than a half-adopted one —
+/// without poisoning reactions queued for other elements in the same drain.
+#[test]
+fn v8_native_first_upgrade_marks_failed_on_throwing_constructor() {
+    let mut runtime = V8Runtime::new(blank_dom());
+    runtime.set_native_ce_reactions(true);
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"(() => {
+                const bad = document.createElement('x-native-throws');
+                const good = document.createElement('x-native-ok');
+
+                class Bad extends HTMLElement {
+                    constructor() { super(); throw new Error('nope'); }
+                }
+                globalThis.__good_connected__ = 0;
+                class Good extends HTMLElement {
+                    connectedCallback() { globalThis.__good_connected__++; }
+                }
+                __aurora_ce_define_native('x-native-throws', Bad);
+                __aurora_ce_define_native('x-native-ok', Good);
+
+                const container = document.createElement('div');
+                document.body.appendChild(container);
+                container.appendChild(bad);
+                container.appendChild(good);
+
+                return 'bad=' + __aurora_ce_state_native(bad) +
+                    ' good=' + __aurora_ce_state_native(good) +
+                    ' goodConnected=' + globalThis.__good_connected__;
+            })()"#,
+        ),
+        Ok("bad=failed good=custom goodConnected=1".to_string())
+    );
+}
+
 /// `__aurora_ce_has_pending_connected_reaction_native` must report only
 /// pending `connectedCallback` reactions, not just "some reaction queued".
 /// The JS shim (`connectUpgraded`) defers to the native trampoline when this
@@ -1078,6 +1215,363 @@ fn v8_defers_stamped_child_upgrade_until_polymer_finishes_indexing() {
     assert_eq!(
         runtime.eval_to_string("String(globalThis.stampChildConnected)"),
         Ok("true".to_string())
+    );
+}
+
+#[test]
+fn v8_defers_controller_stamped_child_upgrade_until_indexing_finishes() {
+    let mut runtime = V8Runtime::new(blank_dom());
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"
+            (() => {
+            const events = [];
+            function ControllerStampChild() {
+                events.push('child-ctor');
+                HTMLElement.call(this);
+            }
+            ControllerStampChild.prototype = Object.create(HTMLElement.prototype);
+            ControllerStampChild.prototype.constructor = ControllerStampChild;
+            ControllerStampChild.prototype.ready = function() {
+                events.push('child-ready');
+            };
+
+            function ControllerStampHost() { HTMLElement.call(this); }
+            ControllerStampHost.prototype = Object.create(HTMLElement.prototype);
+            ControllerStampHost.prototype.constructor = ControllerStampHost;
+            // Aurora sees this shell method, but YouTube delegates ready() to
+            // a raw controller on `inst`. Its public polymerController proxy
+            // intentionally does not expose private methods like _stampTemplate.
+            ControllerStampHost.prototype._stampTemplate = function() {
+                throw new Error('shell stamp should not run');
+            };
+            ControllerStampHost.prototype.created = function() {
+                const host = this;
+                this.inst = {
+                    hostElement: host,
+                    _stampTemplate(template) {
+                        const fragment = document.importNode(template.content, true);
+                        events.length = 0;
+                        events.push('stamp-start');
+                        const child = fragment.childNodes[0];
+                        events.push('during:' + !!child.__ce_upgraded__);
+                        events.push('stamp-end');
+                        return fragment;
+                    },
+                    ready() {
+                        const template = document.createElement('template');
+                        template.innerHTML = '<x-controller-stamp-child></x-controller-stamp-child>';
+                        const fragment = this._stampTemplate(template);
+                        events.push('after:' + !!fragment.firstChild.__ce_upgraded__);
+                        this.hostElement.appendChild(fragment);
+                    },
+                };
+                this.polymerController = {
+                    ready() { host.inst.ready(); },
+                };
+            };
+            ControllerStampHost.prototype.ready = function() {
+                this.polymerController.ready();
+            };
+
+            customElements.define('x-controller-stamp-child', ControllerStampChild);
+            customElements.define('x-controller-stamp-host', ControllerStampHost);
+            document.body.appendChild(document.createElement('x-controller-stamp-host'));
+            return events.join('|');
+            })()
+            "#
+        ),
+        Ok(
+            "stamp-start|during:false|stamp-end|child-ctor|child-ready|after:true"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn v8_define_rejects_invalid_and_duplicate_names() {
+    let mut runtime = V8Runtime::new(blank_dom());
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"
+            (() => {
+            const results = [];
+            function make() {
+                function C() { HTMLElement.call(this); }
+                C.prototype = Object.create(HTMLElement.prototype);
+                C.prototype.constructor = C;
+                return C;
+            }
+            try { customElements.define('nohyphen', make()); results.push('no-throw'); }
+            catch (e) { results.push('invalid:' + e.name); }
+
+            const first = make();
+            customElements.define('x-dup', first);
+            try { customElements.define('x-dup', make()); results.push('no-throw'); }
+            catch (e) { results.push('dupname:' + e.name); }
+
+            try { customElements.define('x-other', first); results.push('no-throw'); }
+            catch (e) { results.push('dupctor:' + e.name); }
+            return results.join('|');
+            })()
+            "#
+        ),
+        Ok("invalid:SyntaxError|dupname:NotSupportedError|dupctor:NotSupportedError".to_string())
+    );
+}
+
+#[test]
+fn v8_custom_elements_get_reads_the_native_registry() {
+    let mut runtime = V8Runtime::new(blank_dom());
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"
+            (() => {
+            function C() { HTMLElement.call(this); }
+            C.prototype = Object.create(HTMLElement.prototype);
+            C.prototype.constructor = C;
+            const before = customElements.get('x-lookup') === undefined;
+            customElements.define('x-lookup', C);
+            const after = customElements.get('x-lookup') === C;
+            return 'before=' + before + ' after=' + after;
+            })()
+            "#
+        ),
+        Ok("before=true after=true".to_string())
+    );
+}
+
+#[test]
+fn v8_element_custom_state_tracks_upgrade() {
+    let mut runtime = V8Runtime::new(blank_dom());
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"
+            (() => {
+            const plain = document.createElement('div');
+            const before = __aurora_ce_state_native(plain);
+            const el = document.createElement('x-state-probe');
+            const undef = __aurora_ce_state_native(el);
+            function C() { HTMLElement.call(this); }
+            C.prototype = Object.create(HTMLElement.prototype);
+            C.prototype.constructor = C;
+            customElements.define('x-state-probe', C);
+            document.body.appendChild(el);
+            return 'div=' + before + ' pre=' + undef + ' post=' + __aurora_ce_state_native(el);
+            })()
+            "#
+        ),
+        Ok("div=uncustomized pre=undefined post=custom".to_string())
+    );
+}
+
+#[test]
+fn v8_attach_internals_requires_form_associated_and_round_trips_validity() {
+    let mut runtime = V8Runtime::new(blank_dom());
+
+    assert_eq!(
+        runtime.eval_to_string(
+            r#"
+            (() => {
+            const out = [];
+            function Plain() { HTMLElement.call(this); }
+            Plain.prototype = Object.create(HTMLElement.prototype);
+            Plain.prototype.constructor = Plain;
+            customElements.define('x-plain-internals', Plain);
+            const plain = document.createElement('x-plain-internals');
+            try { plain.attachInternals(); out.push('no-throw'); }
+            catch (e) { out.push('plain:' + e.name); }
+
+            function Formy() { HTMLElement.call(this); }
+            Formy.formAssociated = true;
+            Formy.prototype = Object.create(HTMLElement.prototype);
+            Formy.prototype.constructor = Formy;
+            customElements.define('x-form-internals', Formy);
+            const el = document.createElement('x-form-internals');
+            const internals = el.attachInternals();
+            out.push('willValidate=' + internals.willValidate);
+            out.push('validBefore=' + internals.checkValidity());
+            internals.setFormValue('hello');
+            internals.setValidity({ valueMissing: true }, 'required');
+            out.push('validAfter=' + internals.checkValidity());
+            internals.setValidity({});
+            out.push('validReset=' + internals.checkValidity());
+            try { el.attachInternals(); out.push('no-throw'); }
+            catch (e) { out.push('second:' + e.name); }
+            return out.join('|');
+            })()
+            "#
+        ),
+        Ok(concat!(
+            "plain:NotSupportedError|willValidate=true|validBefore=true|",
+            "validAfter=false|validReset=true|second:NotSupportedError"
+        )
+        .to_string())
+    );
+}
+
+/// The shared preamble for the form lifecycle tests: a form-associated
+/// definition that records every callback it receives into `out`.
+const FORM_ASSOCIATED_DEFINITION: &str = r#"
+    const out = [];
+    function Formy() { HTMLElement.call(this); }
+    Formy.formAssociated = true;
+    Formy.prototype = Object.create(HTMLElement.prototype);
+    Formy.prototype.constructor = Formy;
+    Formy.prototype.formAssociatedCallback = function(form) {
+        out.push('assoc=' + (form ? form.getAttribute('id') : 'null'));
+    };
+    Formy.prototype.formDisabledCallback = function(disabled) {
+        out.push('disabled=' + disabled);
+    };
+    Formy.prototype.formResetCallback = function() { out.push('reset'); };
+"#;
+
+#[test]
+fn v8_form_associated_callback_follows_the_form_owner() {
+    let mut runtime = V8Runtime::new(blank_dom());
+
+    assert_eq!(
+        runtime.eval_to_string(&format!(
+            r#"
+            (() => {{
+            {FORM_ASSOCIATED_DEFINITION}
+            customElements.define('x-owner-track', Formy);
+
+            const form = document.createElement('form');
+            form.setAttribute('id', 'f1');
+            document.body.appendChild(form);
+
+            const el = document.createElement('x-owner-track');
+            form.appendChild(el);
+            form.removeChild(el);
+            return out.join('|');
+            }})()
+            "#
+        )),
+        Ok("assoc=f1|assoc=null".to_string())
+    );
+}
+
+#[test]
+fn v8_form_attribute_associates_across_the_document() {
+    let mut runtime = V8Runtime::new(blank_dom());
+
+    assert_eq!(
+        runtime.eval_to_string(&format!(
+            r#"
+            (() => {{
+            {FORM_ASSOCIATED_DEFINITION}
+            customElements.define('x-form-attr', Formy);
+
+            const target = document.createElement('form');
+            target.setAttribute('id', 'target');
+            document.body.appendChild(target);
+            const other = document.createElement('form');
+            other.setAttribute('id', 'other');
+            document.body.appendChild(other);
+
+            // Inserted inside `other`, but the form attribute points elsewhere.
+            const el = document.createElement('x-form-attr');
+            el.setAttribute('form', 'target');
+            other.appendChild(el);
+
+            // Repointing the attribute moves the association.
+            el.setAttribute('form', 'other');
+            return out.join('|');
+            }})()
+            "#
+        )),
+        Ok("assoc=target|assoc=other".to_string())
+    );
+}
+
+#[test]
+fn v8_form_disabled_callback_follows_an_ancestor_fieldset() {
+    let mut runtime = V8Runtime::new(blank_dom());
+
+    assert_eq!(
+        runtime.eval_to_string(&format!(
+            r#"
+            (() => {{
+            {FORM_ASSOCIATED_DEFINITION}
+            customElements.define('x-disabled-track', Formy);
+
+            const fieldset = document.createElement('fieldset');
+            document.body.appendChild(fieldset);
+            const el = document.createElement('x-disabled-track');
+            fieldset.appendChild(el);
+
+            fieldset.setAttribute('disabled', '');
+            const willValidate = el.attachInternals().willValidate;
+            fieldset.removeAttribute('disabled');
+            return out.join('|') + '|willValidate=' + willValidate;
+            }})()
+            "#
+        )),
+        Ok("disabled=true|disabled=false|willValidate=false".to_string())
+    );
+}
+
+#[test]
+fn v8_form_reset_fires_reset_callback_on_owned_custom_elements() {
+    let mut runtime = V8Runtime::new(blank_dom());
+
+    assert_eq!(
+        runtime.eval_to_string(&format!(
+            r#"
+            (() => {{
+            {FORM_ASSOCIATED_DEFINITION}
+            customElements.define('x-reset-track', Formy);
+
+            const form = document.createElement('form');
+            form.setAttribute('id', 'f1');
+            document.body.appendChild(form);
+            const owned = document.createElement('x-reset-track');
+            form.appendChild(owned);
+
+            // Outside the form, so it must not be reset by it.
+            const unowned = document.createElement('x-reset-track');
+            document.body.appendChild(unowned);
+
+            out.length = 0;
+            form.reset();
+            return out.join('|');
+            }})()
+            "#
+        )),
+        Ok("reset".to_string())
+    );
+}
+
+#[test]
+fn v8_element_internals_form_resolves_live() {
+    let mut runtime = V8Runtime::new(blank_dom());
+
+    assert_eq!(
+        runtime.eval_to_string(&format!(
+            r#"
+            (() => {{
+            {FORM_ASSOCIATED_DEFINITION}
+            customElements.define('x-internals-form', Formy);
+
+            const el = document.createElement('x-internals-form');
+            const internals = el.attachInternals();
+            // attachInternals runs while the element is still disconnected,
+            // which is exactly when a snapshot would go stale.
+            const before = internals.form === null;
+            const form = document.createElement('form');
+            document.body.appendChild(form);
+            form.appendChild(el);
+            return 'before=' + before + ' after=' + (internals.form === form);
+            }})()
+            "#
+        )),
+        Ok("before=true after=true".to_string())
     );
 }
 

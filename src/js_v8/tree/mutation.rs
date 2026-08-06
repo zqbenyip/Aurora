@@ -1,4 +1,5 @@
 use super::*;
+use crate::js_v8::form_associated;
 use crate::js_v8::mutation_observer;
 use crate::js_v8::registry::NodeRegistry;
 use crate::window::SnapshotRebuildReason;
@@ -200,9 +201,7 @@ pub(crate) fn apply_dom_mutation(
             let mut changed = false;
             let mut old_value = None;
             if let Node::Element(el) = &mut *node.borrow_mut() {
-                old_value = el
-                    .attributes
-                    .insert(name.to_string(), value.to_string());
+                old_value = el.attributes.insert(name.to_string(), value.to_string());
                 changed = true;
             }
             let render_synced = if changed {
@@ -213,6 +212,7 @@ pub(crate) fn apply_dom_mutation(
                     old_value,
                     Some(value.to_string()),
                 );
+                form_associated::sync_after_attribute_change(registry, node, name);
                 registry.mark_style_dirty(node);
                 let render_synced = registry.sync_attribute_to_render_document(node, name, value);
                 if render_synced {
@@ -244,6 +244,7 @@ pub(crate) fn apply_dom_mutation(
                 // change for the callback's purposes.
                 if old_value.is_some() {
                     enqueue_attribute_changed_reaction(registry, node, name, old_value, None);
+                    form_associated::sync_after_attribute_change(registry, node, name);
                 }
                 registry.mark_style_dirty(node);
                 let render_synced = registry.sync_remove_attribute_from_render_document(node, name);
@@ -439,7 +440,15 @@ fn enqueue_lifecycle_reactions(
         };
         if let Some(tag) = tag {
             if is_connected_to(&document, &node) {
-                if let Some(definition) = registry.ce_registry.lookup(&tag) {
+                // "Try to upgrade" runs first: an element inserted before its
+                // definition existed is still Undefined here, and the spec
+                // upgrades it on insertion rather than waiting for script. When
+                // it upgrades, it has already enqueued this element's connect
+                // and attribute reactions, so the definition branch below must
+                // not enqueue them a second time.
+                let upgraded = matches!(phase, LifecyclePhase::Connected)
+                    && super::super::custom_elements::try_upgrade_element(registry, &node, true);
+                if let Some(definition) = registry.ce_registry.lookup(&tag).filter(|_| !upgraded) {
                     match phase {
                         LifecyclePhase::Connected => {
                             let id = registry.register(node.clone());
@@ -472,6 +481,33 @@ fn enqueue_lifecycle_reactions(
                             }
                         }
                     }
+                }
+                // Form association comes last, so its reactions queue behind
+                // the upgrade and connect reactions for the same element.
+                match phase {
+                    LifecyclePhase::Connected => {
+                        form_associated::sync_form_association(registry, &document, &node, &tag)
+                    }
+                    LifecyclePhase::Disconnected => {
+                        form_associated::clear_form_association(registry, &node, &tag)
+                    }
+                }
+                if upgraded {
+                    // A freshly-upgraded element descends shadow-first. That
+                    // differs from the order below and looks accidental, but
+                    // YouTube inserts hosts that already carry an adopted
+                    // shadow root, so it is load-bearing for reaction order
+                    // there — left as-is rather than unified blind.
+                    for child in children.iter().rev() {
+                        stack.push(child.clone());
+                    }
+                    if let Some(shadow) = shadow {
+                        stack.push(shadow);
+                    }
+                    if let Some(template) = template {
+                        stack.push(template);
+                    }
+                    continue;
                 }
             }
         }

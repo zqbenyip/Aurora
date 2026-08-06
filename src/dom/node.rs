@@ -161,6 +161,10 @@ pub struct ElementNode {
     /// Open shadow root, stored separately from light DOM children. Rendering
     /// may flatten this into Blitz while JS keeps distinct ShadowRoot identity.
     pub shadow_root: Option<NodePtr>,
+    /// Whether this element is "defined" for the `:defined` selector: false
+    /// only for a custom element still in the `undefined` or `failed` state.
+    /// Written through by the custom-element registry on every state change.
+    pub custom_element_defined: bool,
     /// For `<slot>` elements, the list of light-DOM nodes assigned to this slot
     /// by the distribution algorithm.
     pub assigned_nodes: Vec<NodePtr>,
@@ -210,6 +214,7 @@ impl Node {
             children,
             template_contents: None,
             shadow_root: None,
+            custom_element_defined: false,
             assigned_nodes: Vec::new(),
             parent: ParentLink::default(),
         })));

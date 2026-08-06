@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use super::FetchError;
 use reqwest::Method;
 use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderName, HeaderValue, USER_AGENT,
+};
 use url::Url;
 
 /// An HTTP response before browser-facing status handling is applied.
@@ -43,6 +45,25 @@ fn ua_for(url: &str) -> &'static str {
         AURORA_UA
     } else {
         CHROME_UA
+    }
+}
+
+// Without a cookie-consent signal, YouTube/Google serve a stripped
+// "accept cookies to see recommendations" page in place of real content
+// (e.g. home's feed collapses to a single feedNudgeRenderer). Real browsers
+// carry a CONSENT cookie once a user has clicked through the consent wall;
+// `YES+1` is the well-known value that satisfies the server-side check
+// without needing to actually render/interact with the consent UI.
+fn consent_cookie_for(url: &str) -> Option<&'static str> {
+    let host = Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_default();
+    if host.ends_with("youtube.com") || host.ends_with("google.com") || host.ends_with("ytimg.com")
+    {
+        Some("CONSENT=YES+1; SOCS=CAI")
+    } else {
+        None
     }
 }
 
@@ -143,6 +164,9 @@ pub fn fetch_response_with_method(
         .request(method, url)
         .header(ACCEPT, "text/html, text/css, */*")
         .header(USER_AGENT, ua_for(url));
+    if let Some(cookie) = consent_cookie_for(url) {
+        request = request.header(COOKIE, cookie);
+    }
 
     let mut has_content_type = false;
     for (name, value) in headers {

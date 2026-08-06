@@ -48,11 +48,28 @@
                 var Native = globalThis.HTMLElement;
                 if (typeof Native !== 'function') return;
                 function PatchedHTMLElement() {
+                    var ctor = (typeof new.target === 'function' ? new.target : null) ||
+                        (this && this.constructor);
+                    // The element being upgraded comes from the native
+                    // construction stack (js_v8/custom_elements.rs), so
+                    // `super()` inside an upgrade adopts it rather than
+                    // allocating a new element. The HTMLElement constructor is
+                    // specified to set the new instance's prototype from
+                    // new.target, so do that here too — the native side only
+                    // hands back the plain element it already had a wrapper
+                    // for, it does not know about `ctor.prototype`.
+                    if (typeof globalThis.__aurora_ce_construction_stack_top_native === 'function') {
+                        var adopting = globalThis.__aurora_ce_construction_stack_top_native();
+                        if (adopting) {
+                            if (ctor && ctor.prototype) {
+                                try { Object.setPrototypeOf(adopting, ctor.prototype); } catch (e) {}
+                            }
+                            return adopting;
+                        }
+                    }
                     if (upgradeStack.length) {
                         return upgradeStack[upgradeStack.length - 1];
                     }
-                    var ctor = (typeof new.target === 'function' ? new.target : null) ||
-                        (this && this.constructor);
                     var definition = ctor && ctor.__aurora_ce_definition__;
                     if (definition && definition.name) {
                         ensureCreateElementPatch();
@@ -492,6 +509,25 @@
             // composition by moving that fragment into the owner's render root;
             // native DocumentFragment insertion consumes its children.
             function composeDetachedStamp(el) {
+                var skipSpec = globalThis.__AURORA_SKIP_COMPOSE_TAGS__;
+                if (skipSpec) {
+                    var ln = '';
+                    try { ln = el.localName || ''; } catch (e) {}
+                    if (ln) {
+                        var parts = String(skipSpec).split(',');
+                        for (var si = 0; si < parts.length; si++) {
+                            var pat = parts[si];
+                            if (!pat) continue;
+                            if (pat.charAt(0) === '*') {
+                                var suffix = pat.slice(1);
+                                if (suffix && ln.length >= suffix.length &&
+                                    ln.slice(-suffix.length) === suffix) return false;
+                            } else if (pat === ln) {
+                                return false;
+                            }
+                        }
+                    }
+                }
                 var fragment = detachedFragmentFor(el);
                 if (!fragment) return false;
                 var ownerKeys = ['__dataHost', 'dataHost', '_methodHost', '__templatizeOwner', '__host'];
@@ -1384,6 +1420,17 @@
                     !el._stampTemplate.__aurora_connect_suppressed__) {
                     var originalStampTemplate = el._stampTemplate;
                     var wrappedStampTemplate = function() {
+                        if (globalThis.__AURORA_TRACE_STAMP__) {
+                            var host = '?';
+                            try {
+                                host = (this && (this.localName ||
+                                    (this.hostElement && this.hostElement.localName))) || '?';
+                            } catch (e) {}
+                            var via = '';
+                            try { via = new Error().stack.split('\n').slice(2, 12).join(' < '); }
+                            catch (e) {}
+                            console.log('[stamp] ' + host + ' :: ' + via);
+                        }
                         suppressTrackedConnect++;
                         try {
                             return originalStampTemplate.apply(this, arguments);
@@ -1996,12 +2043,43 @@
                 el.__ce_ready__ = true;
                 if (shouldTraceName(name)) trace('ready ' + name);
                 installPolymerIdMapHooks(el);
+                // YouTube registers thin custom-element shells whose ready()
+                // delegates to a separate Polymer controller. The raw controller
+                // lives on `inst`; `polymerController` is commonly a public proxy
+                // that hides private methods such as _stampTemplate. Hook both.
+                var polymerInstance = null;
+                try { polymerInstance = el.inst || null; } catch (e) {}
+                if (polymerInstance && polymerInstance !== el) {
+                    installPolymerIdMapHooks(polymerInstance);
+                }
+                var polymerController = null;
+                try { polymerController = el.polymerController || null; } catch (e) {}
+                if (polymerController && polymerController !== el &&
+                    polymerController !== polymerInstance) {
+                    installPolymerIdMapHooks(polymerController);
+                }
                 installInstanceTemplateIdAccessors(el, el.__aurora_ce_ctor__ || el.constructor);
                 rebuildPolymerIdMap(el);
                 var previousHost = activeLifecycleHost;
                 activeLifecycleHost = el;
+                // Polymer drives ready() itself from _enableProperties, which
+                // connectUpgraded calls moments later. Calling it here as well
+                // readies the element twice and stamps its template twice, which
+                // publishes every child of the template a second time.
+                var polymerDrivesReady = false;
+                if (globalThis.__AURORA_READY_GUARD__) {
+                    try {
+                        // Exactly the condition connectUpgraded uses to decide
+                        // it must call _enableProperties. When that is about to
+                        // happen, Polymer runs ready() itself, so calling it
+                        // here too stamps the template twice.
+                        polymerDrivesReady = el.__dataEnabled === false &&
+                            typeof el._enableProperties === 'function' &&
+                            !shouldSuppressLifecycle(name);
+                    } catch (e) {}
+                }
                 try {
-                    el.ready();
+                    if (!polymerDrivesReady) el.ready();
                 } catch (error) {
                     if (globalThis.__aurora_debug_youtube__ || ceOn()) {
                         traceError('ready ' + name, error);
@@ -2261,6 +2339,12 @@
 
             globalThis.customElements = {
                 define: function(name, ctor, opts) {
+                // Validation and registration are native. Errors propagate to
+                // the caller unchanged, which is what makes Rust the registry
+                // of record rather than a mirror.
+                if (typeof globalThis.__aurora_ce_define_native === 'function') {
+                    globalThis.__aurora_ce_define_native(name, ctor);
+                }
                 if (shouldTraceName(name)) trace('define ' + name);
                 ceLogName('define', name, 'defineCtor=' + ceCtorTag(ctor) +
                     ' ctorChain=' + ceChain(ctor && ctor.prototype) +
@@ -2277,27 +2361,28 @@
                 installSetUpPropsHook(ctor, name);
                 probeCustomElementState(name, null, ctor);
                 flushPending(name);
-                // Mirror the definition into the native registry (Phase 1 of the
-                // native custom-element-reaction plan). The native side captures
-                // the constructor, observedAttributes, and lifecycle callbacks;
-                // JS still drives upgrade/connection for now.
-                if (typeof globalThis.__aurora_ce_define_native === 'function') {
+                // The native registry is the source of truth; it already ran
+                // (and may have thrown) at the top of define.
+                if (false) {
                     try { globalThis.__aurora_ce_define_native(name, ctor); }
                     catch (e) {}
                 }
             },
                 get: function(name) {
+                    if (typeof globalThis.__aurora_ce_get_native === 'function') {
+                        return globalThis.__aurora_ce_get_native(name);
+                    }
                     var definition = getDefinition(name);
                     return definition ? definition.ctor : undefined;
                 },
                 whenDefined: function(name) {
-                    return getDefinition(name) ? Promise.resolve(getDefinition(name).ctor) : new Promise(function(res) {
-                        var orig = customElements.define;
-                        customElements.define = function(n, c, o) {
-                            orig.call(customElements, n, c, o);
-                            if (n === name) res(c);
-                        };
-                    });
+                    if (typeof globalThis.__aurora_ce_when_defined_native === 'function') {
+                        return globalThis.__aurora_ce_when_defined_native(name);
+                    }
+                    var definition = getDefinition(name);
+                    return definition
+                        ? Promise.resolve(definition.ctor)
+                        : new Promise(function() {});
                 },
                 upgrade: function(root) {
                     if (globalThis.__aurora_debug_youtube__) trace('customElements.upgrade');

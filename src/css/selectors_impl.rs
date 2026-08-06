@@ -92,6 +92,9 @@ pub enum AurNonTSPseudoClass {
     Enabled,
     Placeholder,
     Lang(CssString),
+    /// `:defined` — every element except a custom element still in the
+    /// `undefined` or `failed` state.
+    Defined,
     /// `:host` — matches custom elements (tag names containing `-`).
     Host,
     /// `:host(selector)` — matches custom elements that also match the inner selector.
@@ -124,6 +127,7 @@ impl ToCss for AurNonTSPseudoClass {
             Self::Enabled => dest.write_str(":enabled"),
             Self::Placeholder => dest.write_str("::placeholder"),
             Self::Lang(l) => write!(dest, ":lang({})", l.0),
+            Self::Defined => dest.write_str(":defined"),
             Self::Host => dest.write_str(":host"),
             Self::HostWith(_) => dest.write_str(":host(...)"),
             Self::Unknown => dest.write_str(":unknown"),
@@ -224,6 +228,7 @@ impl<'i> selectors::parser::Parser<'i> for AurSelectorParser {
             "disabled" => AurNonTSPseudoClass::Disabled,
             "enabled" => AurNonTSPseudoClass::Enabled,
             "placeholder" => AurNonTSPseudoClass::Placeholder,
+            "defined" => AurNonTSPseudoClass::Defined,
             "host" => AurNonTSPseudoClass::Host,
             _ => AurNonTSPseudoClass::Unknown,
         };
@@ -439,6 +444,9 @@ impl<'a> selectors::Element for CascadeElement<'a> {
         _context: &mut MatchingContext<AuroraSelectorImpl>,
     ) -> bool {
         match pc {
+            AurNonTSPseudoClass::Defined => {
+                !self.element.tag_name.contains('-') || self.element.custom_element_defined
+            }
             AurNonTSPseudoClass::Link => {
                 self.element.tag_name.eq_ignore_ascii_case("a")
                     && self.element.attributes.contains_key("href")
