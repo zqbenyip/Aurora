@@ -223,6 +223,7 @@ fn node_matches_any(
         Node::Element(el) => ElementData {
             tag_name: el.tag_name.clone(),
             attributes: el.attributes.clone(),
+            custom_element_defined: el.custom_element_defined,
         },
         _ => return false,
     };
@@ -243,6 +244,7 @@ fn build_ancestor_chain(root: &NodePtr, target: &NodePtr) -> Vec<ElementData> {
             chain.push(ElementData {
                 tag_name: el.tag_name.clone(),
                 attributes: el.attributes.clone(),
+                custom_element_defined: el.custom_element_defined,
             });
         }
     }
@@ -265,6 +267,7 @@ fn build_sibling_list(root: &NodePtr, target: &NodePtr) -> Vec<ElementData> {
                 Some(ElementData {
                     tag_name: el.tag_name.clone(),
                     attributes: el.attributes.clone(),
+                    custom_element_defined: el.custom_element_defined,
                 })
             } else {
                 None
@@ -299,6 +302,7 @@ fn element_data_of(node: &NodePtr) -> Option<ElementData> {
         Node::Element(el) => Some(ElementData {
             tag_name: el.tag_name.clone(),
             attributes: el.attributes.clone(),
+            custom_element_defined: el.custom_element_defined,
         }),
         _ => None,
     }

@@ -274,6 +274,7 @@ mod tests {
             &crate::css::ElementData {
                 tag_name: "div".to_string(),
                 attributes: Default::default(),
+                custom_element_defined: false,
             },
             &[],
             &[],

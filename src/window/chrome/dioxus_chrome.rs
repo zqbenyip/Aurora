@@ -423,7 +423,10 @@ mod tests {
             Some(ChromeHit::NewTab)
         );
         // In the gap between tabs: nothing.
-        assert_eq!(chrome_hit_test(tab0_left + TAB_WIDTH + 2.0, y, 2, WIN_W), None);
+        assert_eq!(
+            chrome_hit_test(tab0_left + TAB_WIDTH + 2.0, y, 2, WIN_W),
+            None
+        );
         // Outside the tab band vertically: nothing.
         assert_eq!(
             chrome_hit_test(tab0_left + 10.0, TAB_TOP + TAB_HEIGHT + 5.0, 2, WIN_W),
@@ -473,10 +476,9 @@ mod tests {
             IdentityKind::Agent,
             [Capability::ReadWorkspace],
         );
-        let dom = crate::html::Parser::new(
-            "<html><head><title>Alpha</title></head><body></body></html>",
-        )
-        .parse_document();
+        let dom =
+            crate::html::Parser::new("<html><head><title>Alpha</title></head><body></body></html>")
+                .parse_document();
         let props = ChromeProps::from_tabs(
             "https://example.com/",
             &dom,
@@ -514,7 +516,10 @@ mod tests {
         assert!(html.contains("urlbar urlbar-on"));
         assert!(html.contains("url url-edit"));
         assert!(html.contains("wikipedia.o|"), "buffer + caret is rendered");
-        assert!(!html.contains("example.com/"), "page URL is replaced while editing");
+        assert!(
+            !html.contains("example.com/"),
+            "page URL is replaced while editing"
+        );
     }
 
     #[test]
@@ -525,8 +530,7 @@ mod tests {
         .parse_document();
         assert_eq!(tab_label("https://example.com/x", &titled), "Page Title");
 
-        let untitled =
-            crate::html::Parser::new("<html><body>hi</body></html>").parse_document();
+        let untitled = crate::html::Parser::new("<html><body>hi</body></html>").parse_document();
         assert_eq!(tab_label("https://example.com/x", &untitled), "example.com");
     }
 }

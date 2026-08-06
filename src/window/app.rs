@@ -217,7 +217,8 @@ impl AuroraApp {
         paint_content_layer(self, &mut scene, width, height);
         let chrome_props = self.chrome_props();
         let identity = self.input().identity.clone();
-        self.chrome.paint(&mut scene, width, chrome_props, &identity);
+        self.chrome
+            .paint(&mut scene, width, chrome_props, &identity);
 
         let Some(surface) = self.surface.as_ref() else {
             return;
@@ -300,12 +301,9 @@ impl AuroraApp {
         tab.input
             .mark_blitz_snapshot_dirty(SnapshotRebuildReason::PaintFailure);
         tab.input.needs_reflow = true;
-        let effective_result = tab.frame_cache.finish_failed_paint(
-            paint_result,
-            content_scene,
-            width,
-            content_height,
-        );
+        let effective_result =
+            tab.frame_cache
+                .finish_failed_paint(paint_result, content_scene, width, content_height);
         if matches!(effective_result, PaintResult::PreservedLastGoodFrame) {
             log::warn!(
                 "Preserving last successful Blitz content frame after paint failure: consecutive_failures={} last_successful_paint_time={:?}",

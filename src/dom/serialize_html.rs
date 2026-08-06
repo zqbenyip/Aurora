@@ -111,6 +111,7 @@ mod tests {
             children: vec![],
             template_contents: Some(content_fragment),
             shadow_root: None,
+            custom_element_defined: false,
             assigned_nodes: vec![],
             parent: Default::default(),
         })));

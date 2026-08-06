@@ -16,6 +16,7 @@ fn element(tag_name: &str, attrs: &[(&str, &str)]) -> ElementData {
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect::<BTreeMap<_, _>>(),
+        custom_element_defined: false,
     }
 }
 

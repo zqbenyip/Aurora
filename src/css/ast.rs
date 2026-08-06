@@ -13,6 +13,10 @@ pub type Specificity = u32;
 pub struct ElementData {
     pub tag_name: String,
     pub attributes: BTreeMap<String, String>,
+    /// Mirrors `ElementNode::custom_element_defined` for the `:defined`
+    /// selector. Non-custom elements are always defined, so `false` here only
+    /// means "a custom element that has not upgraded".
+    pub custom_element_defined: bool,
 }
 
 #[derive(Debug, Clone)]

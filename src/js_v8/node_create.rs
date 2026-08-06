@@ -1,4 +1,5 @@
 use super::custom_elements::CeReactionsGuard;
+use super::form_associated;
 use super::registry::NodeRegistry;
 use super::selectors::query;
 use super::style_class::{classlist, style};
@@ -426,6 +427,14 @@ pub(super) fn create_js_node<'s>(
         attach_shadow,
         node_external,
     );
+    install_method(
+        scope,
+        template,
+        "attachInternals",
+        attach_internals,
+        node_external,
+    );
+    install_method(scope, template, "reset", form_reset, node_external);
     install_method(
         scope,
         template,
@@ -2635,6 +2644,294 @@ fn get_is_connected(
     retval.set(v8::Boolean::new(scope, connected).into());
 }
 
+/// `element.attachInternals()` — the `ElementInternals` handle a
+/// form-associated custom element uses to publish its submission value and
+/// validity. Throws `NotSupportedError` for elements whose definition did not
+/// set `static formAssociated = true`, and on a second call, per spec.
+///
+/// `form`, `validationMessage` and `willValidate` are accessors rather than
+/// stored values: `attachInternals` is normally called from the constructor,
+/// before the element is connected and before any `setValidity`, so a snapshot
+/// taken here would be permanently stale. `labels` stays empty — Aurora has no
+/// `<label>` association.
+fn attach_internals<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut retval: v8::ReturnValue,
+) {
+    let node_data = node_data_from(args.data());
+    let tag = match &*node_data.node.borrow() {
+        Node::Element(el) => el.tag_name.clone(),
+        _ => String::new(),
+    };
+    let ce = &node_data.registry.ce_registry;
+    if !ce.is_form_associated(&tag) {
+        throw_named_error(
+            scope,
+            "NotSupportedError",
+            "attachInternals requires a form-associated custom element",
+        );
+        return;
+    }
+    let node_id = node_data.registry.register(node_data.node.clone());
+    if ce.has_element_internals(node_id) {
+        throw_named_error(
+            scope,
+            "NotSupportedError",
+            "attachInternals has already been called on this element",
+        );
+        return;
+    }
+    ce.create_element_internals(node_id);
+
+    let external = v8::Local::<v8::External>::try_from(args.data())
+        .expect("callback data is always the External we installed");
+    let template = v8::ObjectTemplate::new(scope);
+    install_readonly_accessor(
+        scope,
+        template,
+        "shadowRoot",
+        get_internals_shadow,
+        external,
+    );
+    install_readonly_accessor(scope, template, "form", get_internals_form, external);
+    install_readonly_accessor(
+        scope,
+        template,
+        "validationMessage",
+        get_internals_validation_message,
+        external,
+    );
+    install_readonly_accessor(
+        scope,
+        template,
+        "willValidate",
+        get_internals_will_validate,
+        external,
+    );
+    install_readonly_accessor(scope, template, "labels", get_internals_labels, external);
+    install_method(
+        scope,
+        template,
+        "setFormValue",
+        internals_set_form_value,
+        external,
+    );
+    install_method(
+        scope,
+        template,
+        "setValidity",
+        internals_set_validity,
+        external,
+    );
+    install_method(
+        scope,
+        template,
+        "checkValidity",
+        internals_check_validity,
+        external,
+    );
+    install_method(
+        scope,
+        template,
+        "reportValidity",
+        internals_check_validity,
+        external,
+    );
+
+    match template.new_instance(scope) {
+        Some(internals) => retval.set(internals.into()),
+        None => retval.set(v8::null(scope).into()),
+    }
+}
+
+/// `internals.shadowRoot` — the element's own shadow root, or null.
+fn get_internals_shadow(
+    scope: &mut v8::PinScope<'_, '_>,
+    _name: v8::Local<v8::Name>,
+    args: v8::PropertyCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let node_data = node_data_from(args.data());
+    let shadow = match &*node_data.node.borrow() {
+        Node::Element(el) => el.shadow_root.clone(),
+        _ => None,
+    };
+    match shadow {
+        Some(root) => {
+            let id = node_data.registry.register(root);
+            match node_data.registry.lookup_js_wrapper(scope, id) {
+                Some(wrapper) => retval.set(wrapper.into()),
+                None => retval.set(v8::null(scope).into()),
+            }
+        }
+        None => retval.set(v8::null(scope).into()),
+    }
+}
+
+/// `internals.form` — the element's current form owner, resolved live.
+fn get_internals_form(
+    scope: &mut v8::PinScope<'_, '_>,
+    _name: v8::Local<v8::Name>,
+    args: v8::PropertyCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let node_data = node_data_from(args.data());
+    let owner = form_associated::form_owner_of(&node_data.document, &node_data.node);
+    match owner {
+        Some(form) => {
+            let id = node_data.registry.register(form);
+            match node_data.registry.lookup_js_wrapper(scope, id) {
+                Some(wrapper) => retval.set(wrapper.into()),
+                None => retval.set(v8::null(scope).into()),
+            }
+        }
+        None => retval.set(v8::null(scope).into()),
+    }
+}
+
+/// `internals.validationMessage` — whatever the last `setValidity` recorded.
+fn get_internals_validation_message(
+    scope: &mut v8::PinScope<'_, '_>,
+    _name: v8::Local<v8::Name>,
+    args: v8::PropertyCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let node_data = node_data_from(args.data());
+    let node_id = node_data.registry.register(node_data.node.clone());
+    let message = node_data.registry.ce_registry.validation_message(node_id);
+    retval.set(v8_str(scope, &message).into());
+}
+
+/// `internals.willValidate` — a disabled element is barred from constraint
+/// validation, so it will not validate.
+fn get_internals_will_validate(
+    scope: &mut v8::PinScope<'_, '_>,
+    _name: v8::Local<v8::Name>,
+    args: v8::PropertyCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let node_data = node_data_from(args.data());
+    let disabled = form_associated::is_actually_disabled(&node_data.node);
+    retval.set(v8::Boolean::new(scope, !disabled).into());
+}
+
+/// `form.reset()` — fires `formResetCallback` on every form-associated custom
+/// element this form owns.
+///
+/// Aurora has no built-in form controls, so resetting their values is not part
+/// of this; the custom-element half is. The method lands on every element
+/// because node methods are installed on one shared template, so it checks the
+/// tag itself and does nothing for a non-`<form>` — the same shape as calling
+/// `reset()` on a `<div>` in a real browser, where the method simply is not
+/// there to do anything.
+fn form_reset(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut _retval: v8::ReturnValue,
+) {
+    let node_data = node_data_from(args.data());
+    let is_form = matches!(&*node_data.node.borrow(), Node::Element(el) if el.tag_name == "form");
+    if !is_form {
+        return;
+    }
+    // Reset is a `[CEReactions]` operation: the callbacks it enqueues must run
+    // before it returns to script.
+    let _guard = CeReactionsGuard::new(scope, &node_data.registry);
+    form_associated::enqueue_reset_reactions(&node_data.registry, &node_data.node);
+}
+
+/// `internals.labels` — always empty; Aurora has no `<label>` association.
+fn get_internals_labels(
+    scope: &mut v8::PinScope<'_, '_>,
+    _name: v8::Local<v8::Name>,
+    _args: v8::PropertyCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    retval.set(v8::Array::new(scope, 0).into());
+}
+
+/// Throw an Error carrying a DOMException `name`.
+fn throw_named_error(scope: &mut v8::PinScope<'_, '_>, name: &str, message: &str) {
+    let Some(message) = v8::String::new(scope, message) else {
+        return;
+    };
+    let error = v8::Exception::error(scope, message);
+    if let Some(obj) = error.to_object(scope) {
+        let key = v8_str(scope, "name");
+        let value = v8_str(scope, name);
+        obj.set(scope, key.into(), value.into());
+    }
+    scope.throw_exception(error);
+}
+
+/// `internals.setFormValue(value)` — record the element's submission value.
+fn internals_set_form_value(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut _retval: v8::ReturnValue,
+) {
+    let node_data = node_data_from(args.data());
+    let node_id = node_data.registry.register(node_data.node.clone());
+    let value = args.get(0);
+    let value = if value.is_null_or_undefined() {
+        None
+    } else {
+        Some(value.to_rust_string_lossy(scope))
+    };
+    node_data
+        .registry
+        .ce_registry
+        .set_form_value(node_id, value);
+}
+
+/// `internals.setValidity(flags, message)` — an empty/absent flags object means
+/// valid, matching the spec's "no constraint is violated" case.
+fn internals_set_validity(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut _retval: v8::ReturnValue,
+) {
+    let node_data = node_data_from(args.data());
+    let node_id = node_data.registry.register(node_data.node.clone());
+    let flags = args.get(0);
+    let mut valid = true;
+    if let Some(flags) = flags.to_object(scope).filter(|_| flags.is_object())
+        && let Some(names) =
+            flags.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
+    {
+        for i in 0..names.length() {
+            if let Some(key) = names.get_index(scope, i)
+                && let Some(value) = flags.get(scope, key)
+                && value.is_true()
+            {
+                valid = false;
+            }
+        }
+    }
+    let message = if args.length() > 1 {
+        args.get(1).to_rust_string_lossy(scope)
+    } else {
+        String::new()
+    };
+    node_data
+        .registry
+        .ce_registry
+        .set_validity(node_id, valid, message);
+}
+
+/// `internals.checkValidity()` / `reportValidity()`.
+fn internals_check_validity(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let node_data = node_data_from(args.data());
+    let node_id = node_data.registry.register(node_data.node.clone());
+    let valid = node_data.registry.ce_registry.is_valid(node_id);
+    retval.set(v8::Boolean::new(scope, valid).into());
+}
+
 fn attach_shadow(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -2646,7 +2943,10 @@ fn attach_shadow(
     let external = v8::Local::<v8::External>::new(scope, external);
     let node_data = unsafe { &*(external.value() as *const NodeData) };
 
-    let opts = args.get(0).to_object(scope).filter(|_| args.get(0).is_object());
+    let opts = args
+        .get(0)
+        .to_object(scope)
+        .filter(|_| args.get(0).is_object());
     let mode = opts
         .and_then(|opts| {
             opts.get(scope, v8_str(scope, "mode").into())
